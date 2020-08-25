@@ -60,14 +60,13 @@ from cqlshlib.util import profile_on, profile_off
 
 from cqlshlib.cql3handling import CqlRuleSet
 from cqlshlib.displaying import NO_COLOR_MAP
-from cqlshlib.formatting import format_value_default, CqlType, DateTimeFormat, EMPTY, get_formatter
+from cqlshlib.formatting import format_value_default, CqlType, DateTimeFormat, EMPTY, get_formatter, BlobType
 from cqlshlib.sslhandling import ssl_settings
 
 PROFILE_ON = False
 STRACE_ON = False
 DEBUG = False  # This may be set to True when initializing the task
 IS_LINUX = platform.system() == 'Linux'
-IS_WINDOWS = platform.system() == 'Windows'
 
 CopyOptions = namedtuple('CopyOptions', 'copy dialect unrecognized')
 
@@ -146,7 +145,7 @@ class SendingChannel(object):
                     msg = self.pending_messages.get()
                     self.pipe.send(msg)
                 except Exception as e:
-                    printmsg('%s: %s' % (e.__class__.__name__, e.message))
+                    printmsg('%s: %s' % (e.__class__.__name__, e.message if hasattr(e, 'message') else str(e)))
 
         feeding_thread = threading.Thread(target=feed)
         feeding_thread.setDaemon(True)
@@ -480,10 +479,8 @@ class CopyTask(object):
     def make_params(self):
         """
         Return a dictionary of parameters to be used by the worker processes.
-        On Windows this dictionary must be pickle-able, therefore we do not pass the
-        parent connection since it may not be pickle-able. Also, on Windows child
-        processes are spawned and not forked, and therefore we don't need to shutdown
-        the parent connection anyway, see CASSANDRA-11749 for more details.
+        On platforms using 'spawn' as the default multiprocessing start method,
+        this dictionary must be picklable.
         """
         shell = self.shell
 
@@ -497,7 +494,6 @@ class CopyTask(object):
                     port=shell.port,
                     ssl=shell.ssl,
                     auth_provider=shell.auth_provider,
-                    parent_cluster=shell.conn if not IS_WINDOWS else None,
                     cql_version=shell.conn.cql_version,
                     config_file=self.config_file,
                     protocol_version=self.protocol_version,
@@ -1171,8 +1167,7 @@ class ImportTask(CopyTask):
                 self.processes.append(ImportProcess(self.update_params(params, i)))
 
             feeder = FeedingProcess(self.outmsg.pipes[-1], self.inmsg.pipes[-1],
-                                    self.outmsg.pipes[:-1], self.fname, self.options,
-                                    self.shell.conn if not IS_WINDOWS else None)
+                                    self.outmsg.pipes[:-1], self.fname, self.options)
             self.processes.append(feeder)
 
             self.start_processes()
@@ -1291,7 +1286,7 @@ class FeedingProcess(mp.Process):
     """
     A process that reads from import sources and sends chunks to worker processes.
     """
-    def __init__(self, inpipe, outpipe, worker_pipes, fname, options, parent_cluster):
+    def __init__(self, inpipe, outpipe, worker_pipes, fname, options):
         super(FeedingProcess, self).__init__(target=self.run)
         self.inpipe = inpipe
         self.outpipe = outpipe
@@ -1305,7 +1300,6 @@ class FeedingProcess(mp.Process):
         self.num_worker_processes = options.copy['numprocesses']
         self.max_pending_chunks = options.copy['maxpendingchunks']
         self.chunk_id = 0
-        self.parent_cluster = parent_cluster
 
     def on_fork(self):
         """
@@ -1315,10 +1309,6 @@ class FeedingProcess(mp.Process):
         self.inmsg = ReceivingChannel(self.inpipe)
         self.outmsg = SendingChannel(self.outpipe)
         self.worker_channels = [SendingChannel(p) for p in self.worker_pipes]
-
-        if self.parent_cluster:
-            printdebugmsg("Closing parent cluster sockets")
-            self.parent_cluster.shutdown()
 
     def run(self):
         pr = profile_on() if PROFILE_ON else None
@@ -1342,7 +1332,7 @@ class FeedingProcess(mp.Process):
         try:
             reader.start()
         except IOError as exc:
-            self.outmsg.send(ImportTaskError(exc.__class__.__name__, exc.message))
+            self.outmsg.send(ImportTaskError(exc.__class__.__name__, exc.message if hasattr(exc, 'message') else str(exc)))
 
         channels = self.worker_channels
         max_pending_chunks = self.max_pending_chunks
@@ -1371,7 +1361,7 @@ class FeedingProcess(mp.Process):
                     if rows:
                         sent += self.send_chunk(ch, rows)
                 except Exception as exc:
-                    self.outmsg.send(ImportTaskError(exc.__class__.__name__, exc.message))
+                    self.outmsg.send(ImportTaskError(exc.__class__.__name__, exc.message if hasattr(exc, 'message') else str(exc)))
 
                 if reader.exhausted:
                     break
@@ -1419,7 +1409,6 @@ class ChildProcess(mp.Process):
         self.connect_timeout = params['connect_timeout']
         self.cql_version = params['cql_version']
         self.auth_provider = params['auth_provider']
-        self.parent_cluster = params['parent_cluster']
         self.ssl = params['ssl']
         self.protocol_version = params['protocol_version']
         self.config_file = params['config_file']
@@ -1450,10 +1439,6 @@ class ChildProcess(mp.Process):
         """
         self.inmsg = ReceivingChannel(self.inpipe)
         self.outmsg = SendingChannel(self.outpipe)
-
-        if self.parent_cluster:
-            printdebugmsg("Closing parent cluster sockets")
-            self.parent_cluster.shutdown()
 
     def close(self):
         printdebugmsg("Closing queues...")
@@ -1933,7 +1918,10 @@ class ImportConversion(object):
             return converters.get(t.typename, convert_unknown)(v, ct=t)
 
         def convert_blob(v, **_):
-            return bytearray.fromhex(v[2:])
+            if sys.version_info.major >= 3:
+                return bytes.fromhex(v[2:])
+            else:
+                return BlobType(v[2:].decode("hex"))
 
         def convert_text(v, **_):
             return ensure_str(v)
@@ -2629,7 +2617,7 @@ class ImportProcess(ChildProcess):
                 pk = get_row_partition_key_values(row)
                 rows_by_ring_pos[get_ring_pos(ring, pk_to_token_value(pk))].append(row)
             except Exception as e:
-                errors[e.message].append(row)
+                errors[e.message if hasattr(e, 'message') else str(e)].append(row)
 
         if errors:
             for msg, rows in errors.items():

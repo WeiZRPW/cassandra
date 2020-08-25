@@ -23,6 +23,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
@@ -33,6 +34,8 @@ import com.google.common.util.concurrent.AbstractFuture;
 
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.MoreExecutors;
+
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.locator.EndpointsByRange;
 import org.apache.cassandra.locator.EndpointsForRange;
 import org.slf4j.Logger;
@@ -58,6 +61,7 @@ import org.apache.cassandra.gms.IFailureDetectionEventListener;
 import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.metrics.RepairMetrics;
 import org.apache.cassandra.net.RequestCallback;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
@@ -70,7 +74,6 @@ import org.apache.cassandra.repair.consistent.CoordinatorSessions;
 import org.apache.cassandra.repair.consistent.LocalSessions;
 import org.apache.cassandra.repair.messages.*;
 import org.apache.cassandra.schema.TableId;
-import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.Pair;
@@ -126,23 +129,55 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
 
     private final ConcurrentMap<UUID, ParentRepairSession> parentRepairSessions = new ConcurrentHashMap<>();
 
-    public final static ExecutorService repairCommandExecutor;
     static
     {
-        Config.RepairCommandPoolFullStrategy strategy = DatabaseDescriptor.getRepairCommandPoolFullStrategy();
+        RepairMetrics.init();
+    }
+
+    public static class RepairCommandExecutorHandle
+    {
+        private static final ThreadPoolExecutor repairCommandExecutor =
+            initializeExecutor(DatabaseDescriptor.getRepairCommandPoolSize(),
+                               DatabaseDescriptor.getRepairCommandPoolFullStrategy());
+    }
+
+    @VisibleForTesting
+    static ThreadPoolExecutor initializeExecutor(int maxPoolSize, Config.RepairCommandPoolFullStrategy strategy)
+    {
+        int corePoolSize = 1;
         BlockingQueue<Runnable> queue;
         if (strategy == Config.RepairCommandPoolFullStrategy.reject)
+        {
+            // new threads will be created on demand up to max pool
+            // size so we can leave corePoolSize at 1 to start with
             queue = new SynchronousQueue<>();
+        }
         else
+        {
+            // new threads are only created if > corePoolSize threads are running
+            // and the queue is full, so set corePoolSize to the desired max as the
+            // queue will _never_ be full. Idle core threads will eventually time
+            // out and may be re-created if/when subsequent tasks are submitted.
+            corePoolSize = maxPoolSize;
             queue = new LinkedBlockingQueue<>();
+        }
 
-        repairCommandExecutor = new JMXEnabledThreadPoolExecutor(1,
-                                                                 DatabaseDescriptor.getRepairCommandPoolSize(),
-                                                                 1, TimeUnit.HOURS,
-                                                                 queue,
-                                                                 new NamedThreadFactory("Repair-Task"),
-                                                                 "internal",
-                                                                 new ThreadPoolExecutor.AbortPolicy());
+        ThreadPoolExecutor executor = new JMXEnabledThreadPoolExecutor(corePoolSize,
+                                                                       maxPoolSize,
+                                                                       1,
+                                                                       TimeUnit.HOURS,
+                                                                       queue,
+                                                                       new NamedThreadFactory("Repair-Task"),
+                                                                       "internal",
+                                                                       new ThreadPoolExecutor.AbortPolicy());
+        // allow idle core threads to be terminated
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
+
+    public static ThreadPoolExecutor repairCommandExecutor()
+    {
+        return RepairCommandExecutorHandle.repairCommandExecutor;
     }
 
     private final IFailureDetector failureDetector;
@@ -230,6 +265,9 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         // register listeners
         registerOnFdAndGossip(session);
 
+        if (session.previewKind == PreviewKind.REPAIRED)
+            LocalSessions.registerListener(session);
+
         // remove session at completion
         session.addListener(new Runnable()
         {
@@ -239,6 +277,7 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
             public void run()
             {
                 sessions.remove(session.getId());
+                LocalSessions.unregisterListener(session);
             }
         }, MoreExecutors.directExecutor());
         session.start(executor);
@@ -396,8 +435,25 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         }
     }
 
+    public static boolean verifyCompactionsPendingThreshold(UUID parentRepairSession, PreviewKind previewKind)
+    {
+        // Snapshot values so failure message is consistent with decision
+        int pendingCompactions = CompactionManager.instance.getPendingTasks();
+        int pendingThreshold = ActiveRepairService.instance.getRepairPendingCompactionRejectThreshold();
+        if (pendingCompactions > pendingThreshold)
+        {
+            logger.error("[{}] Rejecting incoming repair, pending compactions ({}) above threshold ({})",
+                          previewKind.logPrefix(parentRepairSession), pendingCompactions, pendingThreshold);
+            return false;
+        }
+        return true;
+    }
+
     public UUID prepareForRepair(UUID parentRepairSession, InetAddressAndPort coordinator, Set<InetAddressAndPort> endpoints, RepairOption options, boolean isForcedRepair, List<ColumnFamilyStore> columnFamilyStores)
     {
+        if (!verifyCompactionsPendingThreshold(parentRepairSession, options.getPreviewKind()))
+            failRepair(parentRepairSession, "Rejecting incoming repair, pending compactions above threshold"); // failRepair throws exception
+
         long repairedAt = getRepairedAt(options, isForcedRepair);
         registerParentRepairSession(parentRepairSession, coordinator, columnFamilyStores, options.getRanges(), options.isIncremental(), repairedAt, options.isGlobal(), options.getPreviewKind());
         final CountDownLatch prepareLatch = new CountDownLatch(endpoints.size());
@@ -456,10 +512,8 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         }
         try
         {
-            // Failed repair is expensive so we wait for longer time.
-            if (!prepareLatch.await(1, TimeUnit.HOURS)) {
+            if (!prepareLatch.await(DatabaseDescriptor.getRpcTimeout(TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS))
                 failRepair(parentRepairSession, "Did not get replies from all endpoints.");
-            }
         }
         catch (InterruptedException e)
         {
@@ -517,12 +571,15 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
     public synchronized ParentRepairSession removeParentRepairSession(UUID parentSessionId)
     {
         String snapshotName = parentSessionId.toString();
-        for (ColumnFamilyStore cfs : getParentRepairSession(parentSessionId).columnFamilyStores.values())
+        ParentRepairSession session = parentRepairSessions.remove(parentSessionId);
+        if (session == null)
+            return null;
+        for (ColumnFamilyStore cfs : session.columnFamilyStores.values())
         {
             if (cfs.snapshotExists(snapshotName))
                 cfs.clearSnapshot(snapshotName);
         }
-        return parentRepairSessions.remove(parentSessionId);
+        return session;
     }
 
     public void handleMessage(Message<? extends RepairMessage> message)
@@ -670,6 +727,16 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
             for (UUID id : toRemove)
                 removeParentRepairSession(id);
         }
+    }
+
+    public int getRepairPendingCompactionRejectThreshold()
+    {
+        return DatabaseDescriptor.getRepairPendingCompactionRejectThreshold();
+    }
+
+    public void setRepairPendingCompactionRejectThreshold(int value)
+    {
+        DatabaseDescriptor.setRepairPendingCompactionRejectThreshold(value);
     }
 
 }

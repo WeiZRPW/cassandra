@@ -42,6 +42,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.cache.CacheLoader;
 import com.google.common.collect.Iterables;
@@ -53,8 +54,6 @@ import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.audit.AuditLogManager;
-import org.apache.cassandra.audit.FullQueryLoggerOptions;
 import org.apache.cassandra.batchlog.Batch;
 import org.apache.cassandra.batchlog.BatchlogManager;
 import org.apache.cassandra.concurrent.Stage;
@@ -194,6 +193,15 @@ public class StorageProxy implements StorageProxyMBean
     private static final Map<ConsistencyLevel, ClientWriteRequestMetrics> writeMetricsMap = new EnumMap<>(ConsistencyLevel.class);
 
     private static final double CONCURRENT_SUBREQUESTS_MARGIN = 0.10;
+
+    /**
+     * Introduce a maximum number of sub-ranges that the coordinator can request in parallel for range queries. Previously
+     * we would request up to the maximum number of ranges but this causes problems if the number of vnodes is large.
+     * By default we pick 10 requests per core, assuming all replicas have the same number of cores. The idea is that we
+     * don't want a burst of range requests that will back up, hurting all other queries. At the same time,
+     * we want to give range queries a chance to run if resources are available.
+     */
+    private static final int MAX_CONCURRENT_RANGE_REQUESTS = Math.max(1, Integer.getInteger("cassandra.max_concurrent_range_requests", FBUtilities.getAvailableProcessors() * 10));
 
     private StorageProxy()
     {
@@ -609,7 +617,6 @@ public class StorageProxy implements StorageProxyMBean
         {
             AbstractReplicationStrategy rs = keyspace.getReplicationStrategy();
             responseHandler = rs.getWriteResponseHandler(replicaPlan, null, WriteType.SIMPLE, queryStartNanoTime);
-            responseHandler.setSupportsBackPressure(false);
         }
 
         Message<Commit> message = Message.outWithFlag(PAXOS_COMMIT_REQ, proposal, MessageFlag.CALL_BACK_ON_FAILURE);
@@ -1331,9 +1338,6 @@ public class StorageProxy implements StorageProxyMBean
             }
         }
 
-        if (backPressureHosts != null)
-            MessagingService.instance().applyBackPressure(backPressureHosts, responseHandler.currentTimeoutNanos());
-
         if (endpointsToHint != null)
             submitHint(mutation, EndpointsForToken.copyOf(mutation.key().getToken(), endpointsToHint), responseHandler);
 
@@ -1917,7 +1921,8 @@ public class StorageProxy implements StorageProxyMBean
         return (maxExpectedResults / DatabaseDescriptor.getNumTokens()) / keyspace.getReplicationStrategy().getReplicationFactor().allReplicas;
     }
 
-    private static class RangeIterator extends AbstractIterator<ReplicaPlan.ForRangeRead>
+    @VisibleForTesting
+    public static class RangeIterator extends AbstractIterator<ReplicaPlan.ForRangeRead>
     {
         private final Keyspace keyspace;
         private final ConsistencyLevel consistency;
@@ -1946,17 +1951,17 @@ public class StorageProxy implements StorageProxyMBean
             if (!ranges.hasNext())
                 return endOfData();
 
-            return ReplicaPlans.forRangeRead(keyspace, consistency, ranges.next());
+            return ReplicaPlans.forRangeRead(keyspace, consistency, ranges.next(), 1);
         }
     }
 
-    private static class RangeMerger extends AbstractIterator<ReplicaPlan.ForRangeRead>
+    public static class RangeMerger extends AbstractIterator<ReplicaPlan.ForRangeRead>
     {
         private final Keyspace keyspace;
         private final ConsistencyLevel consistency;
         private final PeekingIterator<ReplicaPlan.ForRangeRead> ranges;
 
-        private RangeMerger(Iterator<ReplicaPlan.ForRangeRead> iterator, Keyspace keyspace, ConsistencyLevel consistency)
+        public RangeMerger(Iterator<ReplicaPlan.ForRangeRead> iterator, Keyspace keyspace, ConsistencyLevel consistency)
         {
             this.keyspace = keyspace;
             this.consistency = consistency;
@@ -2031,7 +2036,7 @@ public class StorageProxy implements StorageProxyMBean
         }
     }
 
-    private static class RangeCommandIterator extends AbstractIterator<RowIterator> implements PartitionIterator
+    public static class RangeCommandIterator extends AbstractIterator<RowIterator> implements PartitionIterator
     {
         private final Iterator<ReplicaPlan.ForRangeRead> ranges;
         private final int totalRangeCount;
@@ -2043,19 +2048,27 @@ public class StorageProxy implements StorageProxyMBean
         private DataLimits.Counter counter;
         private PartitionIterator sentQueryIterator;
 
+        private final int maxConcurrencyFactor;
         private int concurrencyFactor;
         // The two following "metric" are maintained to improve the concurrencyFactor
         // when it was not good enough initially.
         private int liveReturned;
         private int rangesQueried;
+        private int batchesRequested = 0;
 
-        public RangeCommandIterator(RangeIterator ranges, PartitionRangeReadCommand command, int concurrencyFactor, Keyspace keyspace, ConsistencyLevel consistency, long queryStartNanoTime)
+        public RangeCommandIterator(Iterator<ReplicaPlan.ForRangeRead> ranges,
+                                    PartitionRangeReadCommand command,
+                                    int concurrencyFactor,
+                                    int maxConcurrencyFactor,
+                                    int totalRangeCount,
+                                    long queryStartNanoTime)
         {
             this.command = command;
             this.concurrencyFactor = concurrencyFactor;
+            this.maxConcurrencyFactor = maxConcurrencyFactor;
             this.startTime = System.nanoTime();
-            this.ranges = new RangeMerger(ranges, keyspace, consistency);
-            this.totalRangeCount = ranges.rangeCount();
+            this.ranges = ranges;
+            this.totalRangeCount = totalRangeCount;
             this.queryStartNanoTime = queryStartNanoTime;
             this.enforceStrictLiveness = command.metadata().enforceStrictLiveness();
         }
@@ -2104,20 +2117,30 @@ public class StorageProxy implements StorageProxyMBean
 
         private void updateConcurrencyFactor()
         {
+            liveReturned += counter.counted();
+
+            concurrencyFactor = computeConcurrencyFactor(totalRangeCount, rangesQueried, maxConcurrencyFactor, command.limits().count(), liveReturned);
+        }
+
+        @VisibleForTesting
+        public static int computeConcurrencyFactor(int totalRangeCount, int rangesQueried, int maxConcurrencyFactor, int limit, int liveReturned)
+        {
+            maxConcurrencyFactor = Math.max(1, Math.min(maxConcurrencyFactor, totalRangeCount - rangesQueried));
             if (liveReturned == 0)
             {
-                // we haven't actually gotten any results, so query all remaining ranges at once
-                concurrencyFactor = totalRangeCount - rangesQueried;
-                return;
+                // we haven't actually gotten any results, so query up to the limit if not results so far
+                Tracing.trace("Didn't get any response rows; new concurrent requests: {}", maxConcurrencyFactor);
+                return maxConcurrencyFactor;
             }
 
             // Otherwise, compute how many rows per range we got on average and pick a concurrency factor
             // that should allow us to fetch all remaining rows with the next batch of (concurrent) queries.
-            int remainingRows = command.limits().count() - liveReturned;
+            int remainingRows = limit - liveReturned;
             float rowsPerRange = (float)liveReturned / (float)rangesQueried;
-            concurrencyFactor = Math.max(1, Math.min(totalRangeCount - rangesQueried, Math.round(remainingRows / rowsPerRange)));
+            int concurrencyFactor = Math.max(1, Math.min(maxConcurrencyFactor, Math.round(remainingRows / rowsPerRange)));
             logger.trace("Didn't get enough response rows; actual rows per range: {}; remaining rows: {}, new concurrent requests: {}",
                          rowsPerRange, remainingRows, concurrencyFactor);
+            return concurrencyFactor;
         }
 
         /**
@@ -2175,14 +2198,19 @@ public class StorageProxy implements StorageProxyMBean
 
             try
             {
-                for (int i = 0; i < concurrencyFactor && ranges.hasNext(); i++)
+                for (int i = 0; i < concurrencyFactor && ranges.hasNext();)
                 {
+                    ReplicaPlan.ForRangeRead range = ranges.next();
+
                     @SuppressWarnings("resource") // response will be closed by concatAndBlockOnRepair, or in the catch block below
-                    SingleRangeResponse response = query(ranges.next(), i == 0);
+                    SingleRangeResponse response = query(range, i == 0);
                     concurrentQueries.add(response);
                     readRepairs.add(response.readRepair);
-                    ++rangesQueried;
+                    // due to RangeMerger, coordinator may fetch more ranges than required by concurrency factor.
+                    rangesQueried += range.vnodeCount();
+                    i += range.vnodeCount();
                 }
+                batchesRequested++;
             }
             catch (Throwable t)
             {
@@ -2212,6 +2240,18 @@ public class StorageProxy implements StorageProxyMBean
                 Keyspace.openAndGetStore(command.metadata()).metric.coordinatorScanLatency.update(latency, TimeUnit.NANOSECONDS);
             }
         }
+
+        @VisibleForTesting
+        public int rangesQueried()
+        {
+            return rangesQueried;
+        }
+
+        @VisibleForTesting
+        public int batchesRequested()
+        {
+            return batchesRequested;
+        }
     }
 
     @SuppressWarnings("resource")
@@ -2227,16 +2267,23 @@ public class StorageProxy implements StorageProxyMBean
         // underestimate how many rows we will get per-range in order to increase the likelihood that we'll
         // fetch enough rows in the first round
         resultsPerRange -= resultsPerRange * CONCURRENT_SUBREQUESTS_MARGIN;
+        int maxConcurrencyFactor = Math.min(ranges.rangeCount(), MAX_CONCURRENT_RANGE_REQUESTS);
         int concurrencyFactor = resultsPerRange == 0.0
-                              ? 1
-                              : Math.max(1, Math.min(ranges.rangeCount(), (int) Math.ceil(command.limits().count() / resultsPerRange)));
+                                ? 1
+                                : Math.max(1, Math.min(maxConcurrencyFactor, (int) Math.ceil(command.limits().count() / resultsPerRange)));
         logger.trace("Estimated result rows per range: {}; requested rows: {}, ranges.size(): {}; concurrent range requests: {}",
                      resultsPerRange, command.limits().count(), ranges.rangeCount(), concurrencyFactor);
         Tracing.trace("Submitting range requests on {} ranges with a concurrency of {} ({} rows per range expected)", ranges.rangeCount(), concurrencyFactor, resultsPerRange);
 
         // Note that in general, a RangeCommandIterator will honor the command limit for each range, but will not enforce it globally.
-
-        return command.limits().filter(command.postReconciliationProcessing(new RangeCommandIterator(ranges, command, concurrencyFactor, keyspace, consistencyLevel, queryStartNanoTime)),
+        RangeMerger mergedRanges = new RangeMerger(ranges, keyspace, consistencyLevel);
+        RangeCommandIterator rangeCommandIterator = new RangeCommandIterator(mergedRanges,
+                                                                             command,
+                                                                             concurrencyFactor,
+                                                                             maxConcurrencyFactor,
+                                                                             ranges.rangeCount(),
+                                                                             queryStartNanoTime);
+        return command.limits().filter(command.postReconciliationProcessing(rangeCommandIterator),
                                        command.nowInSec(),
                                        command.selectsFullPartition(),
                                        command.metadata().enforceStrictLiveness());
@@ -2779,34 +2826,6 @@ public class StorageProxy implements StorageProxyMBean
         return String.format("Updating ideal consistency level new value: %s old value %s", newCL, original.toString());
     }
 
-    @Override
-    public void configureFullQueryLogger(String path, String rollCycle, Boolean blocking, int maxQueueWeight, long maxLogSize, String archiveCommand, int maxArchiveRetries)
-    {
-        FullQueryLoggerOptions fqlOptions = DatabaseDescriptor.getFullQueryLogOptions();
-        path = path != null ? path : fqlOptions.log_dir;
-        rollCycle = rollCycle != null ? rollCycle : fqlOptions.roll_cycle;
-        blocking = blocking != null ? blocking : fqlOptions.block;
-        maxQueueWeight = maxQueueWeight != Integer.MIN_VALUE ? maxQueueWeight : fqlOptions.max_queue_weight;
-        maxLogSize = maxLogSize != Long.MIN_VALUE ? maxLogSize : fqlOptions.max_log_size;
-        archiveCommand = archiveCommand != null ? archiveCommand : fqlOptions.archive_command;
-        maxArchiveRetries = maxArchiveRetries != Integer.MIN_VALUE ? maxArchiveRetries : fqlOptions.max_archive_retries;
-
-        Preconditions.checkNotNull(path, "cassandra.yaml did not set log_dir and not set as parameter");
-        AuditLogManager.getInstance().configureFQL(Paths.get(path), rollCycle, blocking, maxQueueWeight, maxLogSize, archiveCommand, maxArchiveRetries);
-    }
-
-    @Override
-    public void resetFullQueryLogger()
-    {
-        AuditLogManager.getInstance().resetFQL(DatabaseDescriptor.getFullQueryLogOptions().log_dir);
-    }
-
-    @Override
-    public void stopFullQueryLogger()
-    {
-        AuditLogManager.getInstance().disableFQL();
-    }
-
     @Deprecated
     public int getOtcBacklogExpirationInterval() {
         return 0;
@@ -2869,6 +2888,24 @@ public class StorageProxy implements StorageProxyMBean
         return DatabaseDescriptor.reportUnconfirmedRepairedDataMismatches();
     }
 
+    @Override
+    public boolean getSnapshotOnRepairedDataMismatchEnabled()
+    {
+        return DatabaseDescriptor.snapshotOnRepairedDataMismatch();
+    }
+
+    @Override
+    public void enableSnapshotOnRepairedDataMismatch()
+    {
+        DatabaseDescriptor.setSnapshotOnRepairedDataMismatch(true);
+    }
+
+    @Override
+    public void disableSnapshotOnRepairedDataMismatch()
+    {
+        DatabaseDescriptor.setSnapshotOnRepairedDataMismatch(false);
+    }
+
     static class PaxosBallotAndContention
     {
         final UUID ballot;
@@ -2896,5 +2933,59 @@ public class StorageProxy implements StorageProxyMBean
             // handles nulls properly
             return Objects.equals(ballot, that.ballot) && contentions == that.contentions;
         }
+    }
+
+    @Override
+    public boolean getSnapshotOnDuplicateRowDetectionEnabled()
+    {
+        return DatabaseDescriptor.snapshotOnDuplicateRowDetection();
+    }
+
+    @Override
+    public void enableSnapshotOnDuplicateRowDetection()
+    {
+        DatabaseDescriptor.setSnapshotOnDuplicateRowDetection(true);
+    }
+
+    @Override
+    public void disableSnapshotOnDuplicateRowDetection()
+    {
+        DatabaseDescriptor.setSnapshotOnDuplicateRowDetection(false);
+    }
+
+    @Override
+    public boolean getCheckForDuplicateRowsDuringReads()
+    {
+        return DatabaseDescriptor.checkForDuplicateRowsDuringReads();
+    }
+
+    @Override
+    public void enableCheckForDuplicateRowsDuringReads()
+    {
+        DatabaseDescriptor.setCheckForDuplicateRowsDuringReads(true);
+    }
+
+    @Override
+    public void disableCheckForDuplicateRowsDuringReads()
+    {
+        DatabaseDescriptor.setCheckForDuplicateRowsDuringReads(false);
+    }
+
+    @Override
+    public boolean getCheckForDuplicateRowsDuringCompaction()
+    {
+        return DatabaseDescriptor.checkForDuplicateRowsDuringCompaction();
+    }
+
+    @Override
+    public void enableCheckForDuplicateRowsDuringCompaction()
+    {
+        DatabaseDescriptor.setCheckForDuplicateRowsDuringCompaction(true);
+    }
+
+    @Override
+    public void disableCheckForDuplicateRowsDuringCompaction()
+    {
+        DatabaseDescriptor.setCheckForDuplicateRowsDuringCompaction(false);
     }
 }

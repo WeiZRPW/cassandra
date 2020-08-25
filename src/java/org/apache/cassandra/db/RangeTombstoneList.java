@@ -22,6 +22,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.utils.AbstractIterator;
 import com.google.common.collect.Iterators;
 
@@ -400,6 +401,8 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             // make it easier to combine things when iterating over successive slices.
             ClusteringBound s = comparator.compare(starts[start], slice.start()) < 0 ? slice.start() : starts[start];
             ClusteringBound e = comparator.compare(slice.end(), ends[start]) < 0 ? slice.end() : ends[start];
+            if (Slice.isEmpty(comparator, s, e))
+                return Collections.emptyIterator();
             return Iterators.<RangeTombstone>singletonIterator(rangeTombstoneWithNewBounds(start, s, e));
         }
 
@@ -446,6 +449,8 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             // make it easier to combine things when iterator over successive slices.
             ClusteringBound s = comparator.compare(starts[start], slice.start()) < 0 ? slice.start() : starts[start];
             ClusteringBound e = comparator.compare(slice.end(), ends[start]) < 0 ? slice.end() : ends[start];
+            if (Slice.isEmpty(comparator, s, e))
+                return Collections.emptyIterator();
             return Iterators.<RangeTombstone>singletonIterator(rangeTombstoneWithNewBounds(start, s, e));
         }
 
@@ -667,7 +672,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      */
     private void growToFree(int i)
     {
-        int newLength = (capacity() * 3) / 2 + 1;
+        // Introduce getRangeTombstoneResizeFactor
+        int newLength = (int) Math.ceil(capacity() * DatabaseDescriptor.getRangeTombstoneListGrowthFactor());
+        // Fallback to the original calculation if the newLength calculated from the resize factor is not valid.
+        if (newLength <= capacity())
+            newLength = ((capacity() * 3) / 2) + 1;
+        
         grow(i, newLength);
     }
 

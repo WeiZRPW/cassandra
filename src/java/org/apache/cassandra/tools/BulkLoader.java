@@ -246,7 +246,7 @@ public class BulkLoader
     private static SSLOptions buildSSLOptions(EncryptionOptions clientEncryptionOptions)
     {
 
-        if (!clientEncryptionOptions.enabled)
+        if (!clientEncryptionOptions.isEnabled())
         {
             return null;
         }
@@ -305,6 +305,23 @@ public class BulkLoader
         {
             Option option = new Option(opt, longOpt, true, description);
             option.setArgName(argName);
+
+            return addOption(option);
+        }
+
+        /**
+         * Add option with argument and argument name that accepts being defined multiple times as a list
+         * @param opt shortcut for option name
+         * @param longOpt complete option name
+         * @param argName argument name
+         * @param description description of the option
+         * @return updated Options object
+         */
+        public Options addOptionList(String opt, String longOpt, String argName, String description)
+        {
+            Option option = new Option(opt, longOpt, true, description);
+            option.setArgName(argName);
+            option.setArgs(Option.UNLIMITED_VALUES);
 
             return addOption(option);
         }

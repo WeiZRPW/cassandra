@@ -49,11 +49,15 @@ import static org.junit.Assert.fail;
  * unexpected threads.
  *
  * {@link DatabaseDescriptor#toolInitialization()} is tested via unit tests extending
- * {@link org.apache.cassandra.tools.ToolsTester}.
+ * {@link org.apache.cassandra.tools.OfflineToolUtils}.
  */
 public class DatabaseDescriptorRefTest
 {
     static final String[] validClasses = {
+    "org.apache.cassandra.audit.AuditLogOptions",
+    "org.apache.cassandra.audit.BinAuditLogger",
+    "org.apache.cassandra.audit.BinLogAuditLogger",
+    "org.apache.cassandra.audit.IAuditLogger",
     "org.apache.cassandra.auth.AllowAllInternodeAuthenticator",
     "org.apache.cassandra.auth.IInternodeAuthenticator",
     "org.apache.cassandra.auth.IAuthenticator",
@@ -65,10 +69,11 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.config.Config",
     "org.apache.cassandra.config.Config$1",
     "org.apache.cassandra.config.Config$CommitLogSync",
+    "org.apache.cassandra.config.Config$CommitFailurePolicy",
     "org.apache.cassandra.config.Config$DiskAccessMode",
     "org.apache.cassandra.config.Config$DiskFailurePolicy",
-    "org.apache.cassandra.config.Config$CommitFailurePolicy",
     "org.apache.cassandra.config.Config$DiskOptimizationStrategy",
+    "org.apache.cassandra.config.Config$FlushCompression",
     "org.apache.cassandra.config.Config$InternodeCompression",
     "org.apache.cassandra.config.Config$MemtableAllocationType",
     "org.apache.cassandra.config.Config$RepairCommandPoolFullStrategy",
@@ -81,6 +86,7 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.config.EncryptionOptions$ServerEncryptionOptions",
     "org.apache.cassandra.config.EncryptionOptions$ServerEncryptionOptions$InternodeEncryption",
     "org.apache.cassandra.config.EncryptionOptions$ServerEncryptionOptions$OutgoingEncryptedPortSource",
+    "org.apache.cassandra.config.ReplicaFilteringProtectionOptions",
     "org.apache.cassandra.config.YamlConfigurationLoader",
     "org.apache.cassandra.config.YamlConfigurationLoader$PropertiesChecker",
     "org.apache.cassandra.config.YamlConfigurationLoader$PropertiesChecker$1",
@@ -97,9 +103,9 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.dht.IPartitioner",
     "org.apache.cassandra.distributed.api.IInstance",
     "org.apache.cassandra.distributed.api.IIsolatedExecutor",
-    "org.apache.cassandra.distributed.impl.InstanceClassLoader",
+    "org.apache.cassandra.distributed.shared.InstanceClassLoader",
     "org.apache.cassandra.distributed.impl.InstanceConfig",
-    "org.apache.cassandra.distributed.impl.IInvokableInstance",
+    "org.apache.cassandra.distributed.api.IInvokableInstance",
     "org.apache.cassandra.distributed.impl.InvokableInstance$CallableNoExcept",
     "org.apache.cassandra.distributed.impl.InvokableInstance$InstanceFunction",
     "org.apache.cassandra.distributed.impl.InvokableInstance$SerializableBiConsumer",
@@ -116,10 +122,13 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.exceptions.RequestValidationException",
     "org.apache.cassandra.exceptions.CassandraException",
     "org.apache.cassandra.exceptions.TransportException",
+    "org.apache.cassandra.fql.FullQueryLogger",
+    "org.apache.cassandra.fql.FullQueryLoggerOptions",
     "org.apache.cassandra.locator.IEndpointSnitch",
     "org.apache.cassandra.io.FSWriteError",
     "org.apache.cassandra.io.FSError",
     "org.apache.cassandra.io.compress.ICompressor",
+    "org.apache.cassandra.io.compress.ICompressor$Uses",
     "org.apache.cassandra.io.compress.LZ4Compressor",
     "org.apache.cassandra.io.sstable.metadata.MetadataType",
     "org.apache.cassandra.io.util.BufferedDataOutputStreamPlus",
@@ -132,9 +141,9 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.locator.Replica",
     "org.apache.cassandra.locator.SimpleSeedProvider",
     "org.apache.cassandra.locator.SeedProvider",
-    "org.apache.cassandra.net.BackPressureStrategy",
     "org.apache.cassandra.security.EncryptionContext",
     "org.apache.cassandra.service.CacheService$CacheType",
+    "org.apache.cassandra.utils.binlog.BinLogOptions",
     "org.apache.cassandra.utils.FBUtilities",
     "org.apache.cassandra.utils.FBUtilities$1",
     "org.apache.cassandra.utils.CloseableIterator",
@@ -146,13 +155,6 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.LogbackStatusListener$ToLoggerOutputStream",
     "org.apache.cassandra.LogbackStatusListener$WrappedPrintStream",
     "org.apache.cassandra.TeeingAppender",
-    "org.apache.cassandra.audit.IAuditLogger",
-    "org.apache.cassandra.audit.BinAuditLogger",
-    "org.apache.cassandra.audit.BinLogAuditLogger",
-    "org.apache.cassandra.audit.FullQueryLogger",
-    "org.apache.cassandra.audit.AuditLogOptions",
-    "org.apache.cassandra.utils.binlog.BinLogOptions",
-    "org.apache.cassandra.audit.FullQueryLoggerOptions",
     // generated classes
     "org.apache.cassandra.config.ConfigBeanInfo",
     "org.apache.cassandra.config.ConfigCustomizer",

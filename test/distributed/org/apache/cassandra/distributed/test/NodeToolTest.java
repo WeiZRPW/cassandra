@@ -20,16 +20,16 @@ package org.apache.cassandra.distributed.test;
 
 import org.junit.Test;
 
-import org.apache.cassandra.distributed.Cluster;
+import org.apache.cassandra.distributed.api.ICluster;
 
 import static org.junit.Assert.assertEquals;
 
-public class NodeToolTest extends DistributedTestBase
+public class NodeToolTest extends TestBaseImpl
 {
     @Test
     public void test() throws Throwable
     {
-        try (Cluster cluster = init(Cluster.create(1)))
+        try (ICluster cluster = init(builder().withNodes(1).start()))
         {
             assertEquals(0, cluster.get(1).nodetool("help"));
             assertEquals(0, cluster.get(1).nodetool("flush"));

@@ -35,6 +35,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.utils.DynamicList;
 
 import static org.junit.Assert.*;
@@ -243,9 +244,9 @@ public class LongBufferPoolTest
                                          DATE_FORMAT.format(new Date()),
                                          threadCount,
                                          TimeUnit.NANOSECONDS.toMinutes(duration)));
-        long prevPoolSize = BufferPool.MEMORY_USAGE_THRESHOLD;
+        long prevPoolSize = BufferPool.getMemoryUsageThreshold();
         logger.info("Overriding configured BufferPool.MEMORY_USAGE_THRESHOLD={} and enabling BufferPool.DEBUG", poolSize);
-        BufferPool.MEMORY_USAGE_THRESHOLD = poolSize;
+        BufferPool.setMemoryUsageThreshold(poolSize);
         Debug debug = new Debug();
         BufferPool.debug(debug);
 
@@ -287,7 +288,7 @@ public class LongBufferPoolTest
         assertEquals(0, testEnv.executorService.shutdownNow().size());
 
         logger.info("Reverting BufferPool.MEMORY_USAGE_THRESHOLD={}", prevPoolSize);
-        BufferPool.MEMORY_USAGE_THRESHOLD = prevPoolSize;
+        BufferPool.setMemoryUsageThreshold(prevPoolSize);
         BufferPool.debug(null);
 
         testEnv.assertCheckedThreadsSucceeded();
@@ -424,7 +425,7 @@ public class LongBufferPoolTest
 
             BufferCheck allocate(int size)
             {
-                ByteBuffer buffer = BufferPool.get(size);
+                ByteBuffer buffer = BufferPool.get(size, BufferType.OFF_HEAP);
                 assertNotNull(buffer);
                 BufferCheck check = new BufferCheck(buffer, rand.nextLong());
                 assertEquals(size, buffer.capacity());

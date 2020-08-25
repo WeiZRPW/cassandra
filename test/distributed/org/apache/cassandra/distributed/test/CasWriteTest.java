@@ -32,6 +32,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -43,9 +44,10 @@ import org.junit.rules.ExpectedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.distributed.Cluster;
-import org.apache.cassandra.distributed.impl.InstanceClassLoader;
+import org.apache.cassandra.distributed.api.ConsistencyLevel;
+import org.apache.cassandra.distributed.api.ICluster;
+import org.apache.cassandra.distributed.shared.InstanceClassLoader;
 import org.apache.cassandra.exceptions.CasWriteTimeoutException;
 import org.apache.cassandra.exceptions.CasWriteUnknownResultException;
 import org.apache.cassandra.net.Verb;
@@ -54,12 +56,13 @@ import org.hamcrest.BaseMatcher;
 import org.hamcrest.Description;
 
 import static org.hamcrest.CoreMatchers.containsString;
-import static org.junit.Assert.fail;
+import static org.apache.cassandra.distributed.shared.AssertUtils.*;
 
-public class CasWriteTest extends DistributedTestBase
+// TODO: this test should be removed after running in-jvm dtests is set up via the shared API repository
+public class CasWriteTest extends TestBaseImpl
 {
     // Sharing the same cluster to boost test speed. Using a pkGen to make sure queries has distinct pk value for paxos instances.
-    private static Cluster cluster;
+    private static ICluster cluster;
     private static final AtomicInteger pkGen = new AtomicInteger(1_000); // preserve any pk values less than 1000 for manual queries.
     private static final Logger logger = LoggerFactory.getLogger(CasWriteTest.class);
 
@@ -69,12 +72,12 @@ public class CasWriteTest extends DistributedTestBase
     @BeforeClass
     public static void setupCluster() throws Throwable
     {
-        cluster = init(Cluster.create(3));
+        cluster = init(Cluster.build().withNodes(3).start());
         cluster.schemaChange("CREATE TABLE " + KEYSPACE + ".tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck))");
     }
 
     @AfterClass
-    public static void close()
+    public static void close() throws Exception
     {
         cluster.close();
         cluster = null;
@@ -106,7 +109,7 @@ public class CasWriteTest extends DistributedTestBase
     public void testCasWriteTimeoutAtPreparePhase_ReqLost()
     {
         expectCasWriteTimeout();
-        cluster.verbs(Verb.PAXOS_PREPARE_REQ).from(1).to(2, 3).drop().on(); // drop the internode messages to acceptors
+        cluster.filters().verbs(Verb.PAXOS_PREPARE_REQ.id).from(1).to(2, 3).drop().on(); // drop the internode messages to acceptors
         cluster.coordinator(1).execute(mkUniqueCasInsertQuery(1), ConsistencyLevel.QUORUM);
     }
 
@@ -114,7 +117,7 @@ public class CasWriteTest extends DistributedTestBase
     public void testCasWriteTimeoutAtPreparePhase_RspLost()
     {
         expectCasWriteTimeout();
-        cluster.verbs(Verb.PAXOS_PREPARE_RSP).from(2, 3).to(1).drop().on(); // drop the internode messages to acceptors
+        cluster.filters().verbs(Verb.PAXOS_PREPARE_RSP.id).from(2, 3).to(1).drop().on(); // drop the internode messages to acceptors
         cluster.coordinator(1).execute(mkUniqueCasInsertQuery(1), ConsistencyLevel.QUORUM);
     }
 
@@ -122,7 +125,7 @@ public class CasWriteTest extends DistributedTestBase
     public void testCasWriteTimeoutAtProposePhase_ReqLost()
     {
         expectCasWriteTimeout();
-        cluster.verbs(Verb.PAXOS_PROPOSE_REQ).from(1).to(2, 3).drop().on();
+        cluster.filters().verbs(Verb.PAXOS_PROPOSE_REQ.id).from(1).to(2, 3).drop().on();
         cluster.coordinator(1).execute(mkUniqueCasInsertQuery(1), ConsistencyLevel.QUORUM);
     }
 
@@ -130,7 +133,7 @@ public class CasWriteTest extends DistributedTestBase
     public void testCasWriteTimeoutAtProposePhase_RspLost()
     {
         expectCasWriteTimeout();
-        cluster.verbs(Verb.PAXOS_PROPOSE_RSP).from(2, 3).to(1).drop().on();
+        cluster.filters().verbs(Verb.PAXOS_PROPOSE_RSP.id).from(2, 3).to(1).drop().on();
         cluster.coordinator(1).execute(mkUniqueCasInsertQuery(1), ConsistencyLevel.QUORUM);
     }
 
@@ -138,7 +141,7 @@ public class CasWriteTest extends DistributedTestBase
     public void testCasWriteTimeoutAtCommitPhase_ReqLost()
     {
         expectCasWriteTimeout();
-        cluster.verbs(Verb.PAXOS_COMMIT_REQ).from(1).to(2, 3).drop().on();
+        cluster.filters().verbs(Verb.PAXOS_COMMIT_REQ.id).from(1).to(2, 3).drop().on();
         cluster.coordinator(1).execute(mkUniqueCasInsertQuery(1), ConsistencyLevel.QUORUM);
     }
 
@@ -146,7 +149,7 @@ public class CasWriteTest extends DistributedTestBase
     public void testCasWriteTimeoutAtCommitPhase_RspLost()
     {
         expectCasWriteTimeout();
-        cluster.verbs(Verb.PAXOS_COMMIT_RSP).from(2, 3).to(1).drop().on();
+        cluster.filters().verbs(Verb.PAXOS_COMMIT_RSP.id).from(2, 3).to(1).drop().on();
         cluster.coordinator(1).execute(mkUniqueCasInsertQuery(1), ConsistencyLevel.QUORUM);
     }
 
@@ -159,20 +162,20 @@ public class CasWriteTest extends DistributedTestBase
                            Arrays.asList(1, 3),
                            c -> {
                                c.filters().reset();
-                               c.verbs(Verb.PAXOS_PREPARE_REQ).from(1).to(3).drop();
-                               c.verbs(Verb.PAXOS_PROPOSE_REQ).from(1).to(2).drop();
+                               c.filters().verbs(Verb.PAXOS_PREPARE_REQ.id).from(1).to(3).drop();
+                               c.filters().verbs(Verb.PAXOS_PROPOSE_REQ.id).from(1).to(2).drop();
                            },
                            failure ->
                                failure.get() != null &&
                                failure.get()
-                                      .getMessage()
-                                      .contains(CasWriteTimeoutException.class.getCanonicalName()),
+                                      .getClass().getCanonicalName()
+                                      .equals(CasWriteTimeoutException.class.getCanonicalName()),
                            "Expecting cause to be CasWriteTimeoutException");
     }
 
     private void testWithContention(int testUid,
                                     List<Integer> contendingNodes,
-                                    Consumer<Cluster> setupForEachRound,
+                                    Consumer<ICluster> setupForEachRound,
                                     Function<AtomicReference<Throwable>, Boolean> expectedException,
                                     String assertHintMessage) throws InterruptedException
     {
@@ -215,8 +218,7 @@ public class CasWriteTest extends DistributedTestBase
 
     private void expectCasWriteTimeout()
     {
-        thrown.expect(RuntimeException.class);
-        thrown.expectCause(new BaseMatcher<Throwable>()
+        thrown.expect(new BaseMatcher<Throwable>()
         {
             public boolean matches(Object item)
             {
@@ -230,35 +232,51 @@ public class CasWriteTest extends DistributedTestBase
         });
         // unable to assert on class becuase the exception thrown was loaded by a differnet classloader, InstanceClassLoader
         // therefor asserts the FQCN name present in the message as a workaround
-        thrown.expectMessage(containsString(CasWriteTimeoutException.class.getCanonicalName()));
+        thrown.expect(new BaseMatcher<Throwable>()
+        {
+            public boolean matches(Object item)
+            {
+                return item.getClass().getCanonicalName().equals(CasWriteTimeoutException.class.getCanonicalName());
+            }
+
+            public void describeTo(Description description)
+            {
+                description.appendText("Class was expected to be " + CasWriteTimeoutException.class.getCanonicalName() + " but was not");
+            }
+        });
         thrown.expectMessage(containsString("CAS operation timed out"));
     }
 
     @Test
     public void testWriteUnknownResult()
     {
-        while (true)
-        {
-            cluster.filters().reset();
-            int pk = pkGen.getAndIncrement();
-            cluster.filters().verbs(Verb.PAXOS_PROPOSE_REQ.id).from(1).to(3).messagesMatching((from, to, msg) -> {
+        cluster.filters().reset();
+        int pk = pkGen.getAndIncrement();
+        CountDownLatch ready = new CountDownLatch(1);
+        cluster.filters().verbs(Verb.PAXOS_PROPOSE_REQ.id).from(1).to(2, 3).messagesMatching((from, to, msg) -> {
+            if (to == 2)
+            {
                 // Inject a single CAS request in-between prepare and propose phases
                 cluster.coordinator(2).execute(mkCasInsertQuery((a) -> pk, 1, 2),
                                                ConsistencyLevel.QUORUM);
-                return false;
-            }).drop();
+                ready.countDown();
+            } else {
+                Uninterruptibles.awaitUninterruptibly(ready);
+            }
+            return false;
+        }).drop();
 
-            try
-            {
-                cluster.coordinator(1).execute(mkCasInsertQuery((a) -> pk, 1, 1), ConsistencyLevel.QUORUM);
-            }
-            catch (Throwable t)
-            {
-                Assert.assertTrue("Expecting cause to be CasWriteUncertainException",
-                                  t.getMessage().contains(CasWriteUnknownResultException.class.getCanonicalName()));
-                return;
-            }
+        try
+        {
+            cluster.coordinator(1).execute(mkCasInsertQuery((a) -> pk, 1, 1), ConsistencyLevel.QUORUM);
         }
+        catch (Throwable t)
+        {
+            Assert.assertEquals("Expecting cause to be CasWriteUnknownResultException",
+                                CasWriteUnknownResultException.class.getCanonicalName(), t.getClass().getCanonicalName());
+            return;
+        }
+        Assert.fail("Expecting test to throw a CasWriteUnknownResultException");
     }
 
     // every invokation returns a query with an unique pk

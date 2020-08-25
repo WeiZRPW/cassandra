@@ -35,7 +35,6 @@ import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.utils.btree.BTreeSet;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
 
@@ -265,7 +264,7 @@ public final class StatementRestrictions
         }
 
         if (usesSecondaryIndexing)
-            validateSecondaryIndexSelections(selectsOnlyStaticColumns);
+            validateSecondaryIndexSelections();
     }
 
     private void addRestriction(Restriction restriction)
@@ -510,8 +509,7 @@ public final class StatementRestrictions
         checkFalse(!type.allowClusteringColumnSlices() && clusteringColumnsRestrictions.hasSlice(),
                    "Slice restrictions are not supported on the clustering columns in %s statements", type);
 
-        if (!type.allowClusteringColumnSlices()
-               && (!table.isCompactTable() || (table.isCompactTable() && !hasClusteringColumnsRestrictions())))
+        if (!type.allowClusteringColumnSlices())
         {
             if (!selectsOnlyStaticColumns && hasUnrestrictedClusteringColumns())
                 throw invalidRequest("Some clustering keys are missing: %s",
@@ -747,12 +745,6 @@ public final class StatementRestrictions
      */
     public NavigableSet<Clustering> getClusteringColumns(QueryOptions options)
     {
-        // If this is a names command and the table is a static compact one, then as far as CQL is concerned we have
-        // only a single row which internally correspond to the static parts. In which case we want to return an empty
-        // set (since that's what ClusteringIndexNamesFilter expects).
-        if (table.isStaticCompactTable())
-            return BTreeSet.empty(table.comparator);
-
         return clusteringColumnsRestrictions.valuesAsClustering(options);
     }
 
@@ -775,10 +767,7 @@ public final class StatementRestrictions
      */
     public boolean isColumnRange()
     {
-        // For static compact tables we want to ignore the fake clustering column (note that if we weren't special casing,
-        // this would mean a 'SELECT *' on a static compact table would query whole partitions, even though we'll only return
-        // the static part as far as CQL is concerned. This is thus mostly an optimization to use the query-by-name path).
-        int numberOfClusteringColumns = table.isStaticCompactTable() ? 0 : table.clusteringColumns().size();
+        int numberOfClusteringColumns = table.clusteringColumns().size();
         // it is a range query if it has at least one the column alias for which no relation is defined or is not EQ or IN.
         return clusteringColumnsRestrictions.size() < numberOfClusteringColumns
             || !clusteringColumnsRestrictions.hasOnlyEqualityRestrictions();
@@ -800,15 +789,10 @@ public final class StatementRestrictions
                         && nonPrimaryKeyRestrictions.hasMultipleContains());
     }
 
-    private void validateSecondaryIndexSelections(boolean selectsOnlyStaticColumns)
+    private void validateSecondaryIndexSelections()
     {
         checkFalse(keyIsInRelation(),
                    "Select on indexed columns and with IN clause for the PRIMARY KEY are not supported");
-        // When the user only select static columns, the intent is that we don't query the whole partition but just
-        // the static parts. But 1) we don't have an easy way to do that with 2i and 2) since we don't support index on
-        // static columns
-        // so far, 2i means that you've restricted a non static column, so the query is somewhat non-sensical.
-        checkFalse(selectsOnlyStaticColumns, "Queries using 2ndary indexes don't support selecting only static columns");
     }
 
     /**

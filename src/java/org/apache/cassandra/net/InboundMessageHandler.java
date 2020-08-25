@@ -325,7 +325,7 @@ public class InboundMessageHandler extends ChannelInboundHandlerAdapter implemen
         catch (IncompatibleSchemaException e)
         {
             callbacks.onFailedDeserialize(size, header, e);
-            noSpamLogger.info("{} incompatible schema encountered while deserializing a message", id(), e);
+            noSpamLogger.info("{} incompatible schema encountered while deserializing a message", this, e);
         }
         catch (Throwable t)
         {
@@ -415,20 +415,20 @@ public class InboundMessageHandler extends ChannelInboundHandlerAdapter implemen
         {
             receivedBytes += frame.frameSize;
             corruptFramesRecovered++;
-            noSpamLogger.warn("{} invalid, recoverable CRC mismatch detected while reading messages (corrupted self-contained frame)", id());
+            noSpamLogger.warn("{} invalid, recoverable CRC mismatch detected while reading messages (corrupted self-contained frame)", this);
         }
         else if (null == largeMessage) // first frame of a large message
         {
             receivedBytes += frame.frameSize;
             corruptFramesUnrecovered++;
-            noSpamLogger.error("{} invalid, unrecoverable CRC mismatch detected while reading messages (corrupted first frame of a large message)", id());
+            noSpamLogger.error("{} invalid, unrecoverable CRC mismatch detected while reading messages (corrupted first frame of a large message)", this);
             throw new InvalidCrc(frame.readCRC, frame.computedCRC);
         }
         else // subsequent frame of a large message
         {
             processSubsequentFrameOfLargeMessage(frame);
             corruptFramesRecovered++;
-            noSpamLogger.warn("{} invalid, recoverable CRC mismatch detected while reading a large message", id());
+            noSpamLogger.warn("{} invalid, recoverable CRC mismatch detected while reading a large message", this);
         }
     }
 
@@ -578,7 +578,7 @@ public class InboundMessageHandler extends ChannelInboundHandlerAdapter implemen
         {
             globalReserve.release(allocatedExcess);
             globalWaitQueue.signal();
-            return ResourceLimits.Outcome.INSUFFICIENT_GLOBAL;
+            return ResourceLimits.Outcome.INSUFFICIENT_ENDPOINT;
         }
 
         long newQueueSize = queueSizeUpdater.addAndGet(this, bytes);
@@ -690,6 +690,12 @@ public class InboundMessageHandler extends ChannelInboundHandlerAdapter implemen
     String id()
     {
         return SocketFactory.channelId(peer, self, type, channel.id().asShortText());
+    }
+
+    @Override
+    public String toString()
+    {
+        return id();
     }
 
     /*
@@ -822,7 +828,7 @@ public class InboundMessageHandler extends ChannelInboundHandlerAdapter implemen
             catch (IncompatibleSchemaException e)
             {
                 callbacks.onFailedDeserialize(size, header, e);
-                noSpamLogger.info("{} incompatible schema encountered while deserializing a message", id(), e);
+                noSpamLogger.info("{} incompatible schema encountered while deserializing a message", InboundMessageHandler.this, e);
             }
             catch (Throwable t)
             {

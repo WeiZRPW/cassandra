@@ -67,6 +67,14 @@ public class RepairMessageVerbHandler implements IVerbHandler<RepairMessage>
                 case PREPARE_MSG:
                     PrepareMessage prepareMessage = (PrepareMessage) message.payload;
                     logger.debug("Preparing, {}", prepareMessage);
+
+                    if (!ActiveRepairService.verifyCompactionsPendingThreshold(prepareMessage.parentRepairSession, prepareMessage.previewKind))
+                    {
+                        // error is logged in verifyCompactionsPendingThreshold
+                        sendFailureResponse(message);
+                        return;
+                    }
+
                     List<ColumnFamilyStore> columnFamilyStores = new ArrayList<>(prepareMessage.tableIds.size());
                     for (TableId tableId : prepareMessage.tableIds)
                     {
@@ -95,8 +103,8 @@ public class RepairMessageVerbHandler implements IVerbHandler<RepairMessage>
                     final ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(desc.keyspace, desc.columnFamily);
                     if (cfs == null)
                     {
-                        logErrorAndSendFailureResponse(String.format("Table %s.%s was dropped during snapshot phase of repair",
-                                                                     desc.keyspace, desc.columnFamily), message);
+                        logErrorAndSendFailureResponse(String.format("Table %s.%s was dropped during snapshot phase of repair %s",
+                                                                     desc.keyspace, desc.columnFamily, desc.parentSessionId), message);
                         return;
                     }
 
@@ -121,7 +129,8 @@ public class RepairMessageVerbHandler implements IVerbHandler<RepairMessage>
                     ColumnFamilyStore store = ColumnFamilyStore.getIfExists(desc.keyspace, desc.columnFamily);
                     if (store == null)
                     {
-                        logger.error("Table {}.{} was dropped during snapshot phase of repair", desc.keyspace, desc.columnFamily);
+                        logger.error("Table {}.{} was dropped during snapshot phase of repair {}",
+                                     desc.keyspace, desc.columnFamily, desc.parentSessionId);
                         MessagingService.instance().send(Message.out(VALIDATION_RSP, new ValidationResponse(desc)), message.from());
                         return;
                     }
@@ -220,7 +229,12 @@ public class RepairMessageVerbHandler implements IVerbHandler<RepairMessage>
     private void logErrorAndSendFailureResponse(String errorMessage, Message<?> respondTo)
     {
         logger.error(errorMessage);
-        Message reply = respondTo.failureResponse(RequestFailureReason.UNKNOWN);
+        sendFailureResponse(respondTo);
+    }
+
+    private void sendFailureResponse(Message<?> respondTo)
+    {
+        Message<?> reply = respondTo.failureResponse(RequestFailureReason.UNKNOWN);
         MessagingService.instance().send(reply, respondTo.from());
     }
 }

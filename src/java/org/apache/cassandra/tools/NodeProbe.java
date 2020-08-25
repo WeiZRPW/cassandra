@@ -42,6 +42,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import javax.annotation.Nullable;
 import javax.management.JMX;
 import javax.management.MBeanServerConnection;
 import javax.management.MalformedObjectNameException;
@@ -180,6 +181,13 @@ public class NodeProbe implements AutoCloseable
         connect();
     }
 
+    protected NodeProbe()
+    {
+        // this constructor is only used for extensions to rewrite their own connect method
+        this.host = "";
+        this.port = 0;
+    }
+
     /**
      * Create a connection to the JMX agent and setup the M[X]Bean proxies.
      *
@@ -188,7 +196,7 @@ public class NodeProbe implements AutoCloseable
     protected void connect() throws IOException
     {
         JMXServiceURL jmxUrl = new JMXServiceURL(String.format(fmtUrl, host, port));
-        Map<String,Object> env = new HashMap<String,Object>();
+        Map<String, Object> env = new HashMap<String, Object>();
         if (username != null)
         {
             String[] creds = { username, password };
@@ -288,7 +296,7 @@ public class NodeProbe implements AutoCloseable
     private void checkJobs(PrintStream out, int jobs)
     {
         // TODO this should get the configured number of concurrent_compactors via JMX and not using DatabaseDescriptor
-        DatabaseDescriptor.toolInitialization();
+        DatabaseDescriptor.toolInitialization(false); // if running in dtest, this would fail if true (default)
         if (jobs > DatabaseDescriptor.getConcurrentCompactors())
             out.println(String.format("jobs (%d) is bigger than configured concurrent_compactors (%d) on this host, using at most %d threads", jobs, DatabaseDescriptor.getConcurrentCompactors(), DatabaseDescriptor.getConcurrentCompactors()));
     }
@@ -408,7 +416,7 @@ public class NodeProbe implements AutoCloseable
         }
         catch (Exception e)
         {
-            throw new IOException(e) ;
+            throw new IOException(e);
         }
         finally
         {
@@ -814,11 +822,6 @@ public class NodeProbe implements AutoCloseable
         return ssProxy.getNaturalEndpoints(keyspace, cf, key);
     }
 
-    public List<String> getReplicas(String keyspace, String cf, String key)
-    {
-        return ssProxy.getReplicas(keyspace, cf, key);
-    }
-
     public List<String> getSSTables(String keyspace, String cf, String key, boolean hexFormat)
     {
         ColumnFamilyStoreMBean cfsProxy = getCfsProxy(keyspace, cf);
@@ -918,6 +921,10 @@ public class NodeProbe implements AutoCloseable
     public StorageProxyMBean getSpProxy()
     {
         return spProxy;
+    }
+
+    public StorageServiceMBean getStorageService() {
+        return ssProxy;
     }
 
     public GossiperMBean getGossProxy()
@@ -1589,7 +1596,7 @@ public class NodeProbe implements AutoCloseable
 
     /**
      * Retrieve Proxy metrics
-     * @param connections, connectedNativeClients, connectedNativeClientsByUser, clientsByProtocolVersion
+     * @param metricName
      */
     public Object getClientMetric(String metricName)
     {
@@ -1672,7 +1679,7 @@ public class NodeProbe implements AutoCloseable
         }
         catch (Exception e)
         {
-          throw new RuntimeException("Error setting log for " + classQualifier +" on level " + level +". Please check logback configuration and ensure to have <jmxConfigurator /> set", e);
+            throw new RuntimeException("Error setting log for " + classQualifier + " on level " + level + ". Please check logback configuration and ensure to have <jmxConfigurator /> set", e);
         }
     }
 
@@ -1777,9 +1784,14 @@ public class NodeProbe implements AutoCloseable
         ssProxy.disableAuditLog();
     }
 
+    public void enableAuditLog(String loggerName, Map<String, String> parameters, String includedKeyspaces ,String excludedKeyspaces ,String includedCategories ,String excludedCategories ,String includedUsers ,String excludedUsers)
+    {
+        ssProxy.enableAuditLog(loggerName, parameters, includedKeyspaces, excludedKeyspaces, includedCategories, excludedCategories, includedUsers, excludedUsers);
+    }
+
     public void enableAuditLog(String loggerName, String includedKeyspaces ,String excludedKeyspaces ,String includedCategories ,String excludedCategories ,String includedUsers ,String excludedUsers)
     {
-        ssProxy.enableAuditLog(loggerName, includedKeyspaces, excludedKeyspaces, includedCategories, excludedCategories, includedUsers, excludedUsers);
+        this.enableAuditLog(loggerName, Collections.emptyMap(), includedKeyspaces, excludedKeyspaces, includedCategories, excludedCategories, includedUsers, excludedUsers);
     }
 
     public void enableOldProtocolVersions()
@@ -1795,6 +1807,21 @@ public class NodeProbe implements AutoCloseable
     public MessagingServiceMBean getMessagingServiceProxy()
     {
         return msProxy;
+    }
+
+    public void enableFullQueryLogger(String path, String rollCycle, Boolean blocking, int maxQueueWeight, long maxLogSize, @Nullable String archiveCommand, int maxArchiveRetries)
+    {
+        ssProxy.enableFullQueryLogger(path, rollCycle, blocking, maxQueueWeight, maxLogSize, archiveCommand, maxArchiveRetries);
+    }
+
+    public void stopFullQueryLogger()
+    {
+        ssProxy.stopFullQueryLogger();
+    }
+
+    public void resetFullQueryLogger()
+    {
+        ssProxy.resetFullQueryLogger();
     }
 }
 

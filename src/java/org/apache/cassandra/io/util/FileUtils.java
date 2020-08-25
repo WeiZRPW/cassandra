@@ -23,6 +23,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -43,16 +44,15 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.utils.SyncUtil;
-
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.FSErrorHandler;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.JVMStabilityInspector;
-import org.apache.cassandra.utils.memory.MemoryUtil;
+import org.apache.cassandra.utils.SyncUtil;
 
 import static com.google.common.base.Throwables.propagate;
 import static org.apache.cassandra.utils.Throwables.maybeFail;
@@ -93,12 +93,12 @@ public final class FileUtils
             logger.error("FATAL: Cassandra is unable to access required classes. This usually means it has been " +
                 "run without the aid of the standard startup scripts or the scripts have been edited. If this was " +
                 "intentional, and you are attempting to use Java 11+ you may need to add the --add-exports and " +
-                "--add-opens jvm options from either jvm11-server.options or jvm11-client.options");
+                "--add-opens jvm options from either jvm11-server.options or jvm11-client.options", e);
             throw new RuntimeException(e);  // causes ExceptionInInitializerError, will prevent startup
         }
         catch (Throwable t)
         {
-            logger.error("FATAL: Cannot initialize optimized memory deallocator.");
+            logger.error("FATAL: Cannot initialize optimized memory deallocator.", t);
             JVMStabilityInspector.inspectThrowable(t);
             throw new RuntimeException(t); // causes ExceptionInInitializerError, will prevent startup
         }
@@ -192,6 +192,9 @@ public final class FileUtils
     {
         try
         {
+            if (!StorageService.instance.isDaemonSetupCompleted())
+                logger.info("Deleting file during startup: {}", file);
+
             Files.delete(file.toPath());
         }
         catch (Throwable t)
@@ -278,9 +281,13 @@ public final class FileUtils
         {
             channel.truncate(size);
         }
+        catch (NoSuchFileException | FileNotFoundException nfe)
+        {
+            throw new RuntimeException(nfe);
+        }
         catch (IOException e)
         {
-            throw new RuntimeException(e);
+            throw new FSWriteError(e, path);
         }
     }
 
@@ -442,6 +449,9 @@ public final class FileUtils
 
     public static boolean delete(String file)
     {
+        if (!StorageService.instance.isDaemonSetupCompleted())
+            logger.info("Deleting file during startup: {}", file);
+
         File f = new File(file);
         return f.delete();
     }
@@ -450,6 +460,9 @@ public final class FileUtils
     {
         for ( File file : files )
         {
+            if (!StorageService.instance.isDaemonSetupCompleted())
+                logger.info("Deleting file during startup: {}", file);
+
             file.delete();
         }
     }
@@ -594,7 +607,7 @@ public final class FileUtils
      */
     public static void handleFSErrorAndPropagate(FSError e)
     {
-        handleFSError(e);
+        JVMStabilityInspector.inspectThrowable(e);
         throw propagate(e);
     }
 
@@ -722,9 +735,13 @@ public final class FileUtils
                 SyncUtil.force(fc, false);
             }
         }
+        catch (ClosedChannelException cce)
+        {
+            throw new RuntimeException(cce);
+        }
         catch (IOException ex)
         {
-            throw new RuntimeException(ex);
+            throw new FSWriteError(ex, file);
         }
     }
 

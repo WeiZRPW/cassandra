@@ -18,29 +18,34 @@
 
 package org.apache.cassandra.distributed.test;
 
+import java.net.InetSocketAddress;
+import java.util.Iterator;
 import java.util.List;
 
 import org.junit.Test;
 
-import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.distributed.Cluster;
+import org.apache.cassandra.distributed.api.ConsistencyLevel;
+import org.apache.cassandra.distributed.api.ICluster;
+import org.apache.cassandra.distributed.shared.NetworkTopology;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.service.PendingRangeCalculatorService;
 import org.apache.cassandra.service.StorageService;
 
 import static org.apache.cassandra.net.Verb.READ_REPAIR_REQ;
 import static org.apache.cassandra.net.Verb.READ_REQ;
+import static org.apache.cassandra.distributed.shared.AssertUtils.*;
 
-public class ReadRepairTest extends DistributedTestBase
+public class ReadRepairTest extends TestBaseImpl
 {
 
     @Test
     public void readRepairTest() throws Throwable
     {
-        try (Cluster cluster = init(Cluster.create(3)))
+        try (ICluster cluster = init(builder().withNodes(3).start()))
         {
             cluster.schemaChange("CREATE TABLE " + KEYSPACE + ".tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck)) WITH read_repair='blocking'");
 
@@ -62,7 +67,7 @@ public class ReadRepairTest extends DistributedTestBase
     @Test
     public void failingReadRepairTest() throws Throwable
     {
-        try (Cluster cluster = init(Cluster.create(3)))
+        try (ICluster cluster = init(builder().withNodes(3).start()))
         {
             cluster.schemaChange("CREATE TABLE " + KEYSPACE + ".tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck)) WITH read_repair='blocking'");
 
@@ -71,7 +76,7 @@ public class ReadRepairTest extends DistributedTestBase
 
             assertRows(cluster.get(3).executeInternal("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = 1"));
 
-            cluster.verbs(READ_REPAIR_REQ).to(3).drop();
+            cluster.filters().verbs(READ_REPAIR_REQ.id).to(3).drop();
             assertRows(cluster.coordinator(1).execute("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = 1",
                                                       ConsistencyLevel.QUORUM),
                        row(1, 1, 1));
@@ -84,7 +89,7 @@ public class ReadRepairTest extends DistributedTestBase
     @Test
     public void movingTokenReadRepairTest() throws Throwable
     {
-        try (Cluster cluster = init(Cluster.create(4), 3))
+        try (Cluster cluster = (Cluster) init(Cluster.create(4), 3))
         {
             List<Token> tokens = cluster.tokens();
 
@@ -102,11 +107,11 @@ public class ReadRepairTest extends DistributedTestBase
             // write only to #4
             cluster.get(4).executeInternal("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (?, 1, 1)", i);
             // mark #2 as leaving in #4
-            cluster.get(4).acceptsOnInstance((InetAddressAndPort endpoint) -> {
-                StorageService.instance.getTokenMetadata().addLeavingEndpoint(endpoint);
+            cluster.get(4).acceptsOnInstance((InetSocketAddress endpoint) -> {
+                StorageService.instance.getTokenMetadata().addLeavingEndpoint(InetAddressAndPort.getByAddressOverrideDefaults(endpoint.getAddress(), endpoint.getPort()));
                 PendingRangeCalculatorService.instance.update();
                 PendingRangeCalculatorService.instance.blockUntilFinished();
-            }).accept(cluster.get(2).broadcastAddressAndPort());
+            }).accept(cluster.get(2).broadcastAddress());
 
             // prevent #4 from reading or writing to #3, so our QUORUM must contain #2 and #4
             // since #1 is taking over the range, this means any read-repair must make it to #1 as well
@@ -122,4 +127,61 @@ public class ReadRepairTest extends DistributedTestBase
         }
     }
 
+    @Test
+    public void emptyRangeTombstones1() throws Throwable
+    {
+        try (Cluster cluster = init(Cluster.create(2)))
+        {
+            cluster.schemaChange("CREATE TABLE distributed_test_keyspace.tbl (\n" +
+                                 "    key text,\n" +
+                                 "    column1 int,\n" +
+                                 "    PRIMARY KEY (key, column1)\n" +
+                                 ") WITH CLUSTERING ORDER BY (column1 ASC)");
+            cluster.get(1).executeInternal("DELETE FROM distributed_test_keyspace.tbl WHERE key=? AND column1>? AND column1<?;",
+                                           "test", Integer.MIN_VALUE, Integer.MAX_VALUE);
+            cluster.coordinator(2).execute("SELECT * FROM distributed_test_keyspace.tbl WHERE key = ? and column1 > ? and column1 <= ?",
+                                           ConsistencyLevel.ALL,
+                                           "test", 10, 10);
+            cluster.coordinator(2).execute("SELECT * FROM distributed_test_keyspace.tbl WHERE key = ? and column1 > ? and column1 <= ?",
+                                           ConsistencyLevel.ALL,
+                                           "test", 11, 11);
+            cluster.get(2).executeInternal("DELETE FROM distributed_test_keyspace.tbl WHERE key=? AND column1>? AND column1<?;",
+                                           "test", Integer.MIN_VALUE, Integer.MAX_VALUE);
+        }
+    }
+
+    @Test
+    public void emptyRangeTombstonesFromPaging() throws Throwable
+    {
+        try (Cluster cluster = init(Cluster.create(2)))
+        {
+            cluster.schemaChange("CREATE TABLE distributed_test_keyspace.tbl (\n" +
+                                 "    key text,\n" +
+                                 "    column1 int,\n" +
+                                 "    PRIMARY KEY (key, column1)\n" +
+                                 ") WITH CLUSTERING ORDER BY (column1 ASC)");
+
+            cluster.get(1).executeInternal("DELETE FROM distributed_test_keyspace.tbl USING TIMESTAMP 10 WHERE key=? AND column1>? AND column1<?;",
+                                           "test", Integer.MIN_VALUE, Integer.MAX_VALUE);
+
+            for (int i = 0; i < 100; i++)
+                cluster.coordinator(1).execute("INSERT INTO distributed_test_keyspace.tbl (key, column1) VALUES (?, ?) USING TIMESTAMP 30", ConsistencyLevel.ALL, "test", i);
+
+            consume(cluster.coordinator(2).executeWithPaging("SELECT * FROM distributed_test_keyspace.tbl WHERE key = ? and column1 >= ? and column1 <= ?",
+                                           ConsistencyLevel.ALL, 1,
+                                           "test", 8, 12));
+
+            consume(cluster.coordinator(2).executeWithPaging("SELECT * FROM distributed_test_keyspace.tbl WHERE key = ? and column1 >= ? and column1 <= ?",
+                                                             ConsistencyLevel.ALL, 1,
+                                                             "test", 16, 20));
+            cluster.get(2).executeInternal("DELETE FROM distributed_test_keyspace.tbl WHERE key=? AND column1>? AND column1<?;",
+                                           "test", Integer.MIN_VALUE, Integer.MAX_VALUE);
+        }
+    }
+
+    private void consume(Iterator<Object[]> it)
+    {
+        while (it.hasNext())
+            it.next();
+    }
 }
