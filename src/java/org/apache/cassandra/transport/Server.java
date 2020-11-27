@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.codahale.metrics.Reservoir;
+import com.codahale.metrics.Snapshot;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
@@ -44,10 +46,8 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
-import io.netty.handler.timeout.IdleState;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
-import io.netty.util.Version;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -57,6 +57,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.DecayingEstimatedHistogramReservoir;
 import org.apache.cassandra.net.ResourceLimits;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaChangeListener;
@@ -86,7 +87,7 @@ public class Server implements CassandraDaemon.Server
     };
 
     public final InetSocketAddress socket;
-    public boolean useSSL = false;
+    public final EncryptionOptions.TlsEncryptionPolicy tlsEncryptionPolicy;
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
 
     private EventLoopGroup workerGroup;
@@ -94,7 +95,7 @@ public class Server implements CassandraDaemon.Server
     private Server (Builder builder)
     {
         this.socket = builder.getSocket();
-        this.useSSL = builder.useSSL;
+        this.tlsEncryptionPolicy = builder.tlsEncryptionPolicy;
         if (builder.workerGroup != null)
         {
             workerGroup = builder.workerGroup;
@@ -139,29 +140,27 @@ public class Server implements CassandraDaemon.Server
         if (workerGroup != null)
             bootstrap = bootstrap.group(workerGroup);
 
-        if (this.useSSL)
-        {
-            final EncryptionOptions clientEnc = DatabaseDescriptor.getNativeProtocolEncryptionOptions();
+        final EncryptionOptions clientEnc = DatabaseDescriptor.getNativeProtocolEncryptionOptions();
 
-            if (clientEnc.optional)
-            {
-                logger.info("Enabling optionally encrypted CQL connections between client and server");
-                bootstrap.childHandler(new OptionalSecureInitializer(this, clientEnc));
-            }
-            else
-            {
-                logger.info("Enabling encrypted CQL connections between client and server");
-                bootstrap.childHandler(new SecureInitializer(this, clientEnc));
-            }
-        }
-        else
+        switch (this.tlsEncryptionPolicy)
         {
-            bootstrap.childHandler(new Initializer(this));
+            case UNENCRYPTED:
+                bootstrap.childHandler(new Initializer(this));
+                break;
+            case OPTIONAL:
+                logger.debug("Enabling optionally encrypted CQL connections between client and server");
+                bootstrap.childHandler(new OptionalSecureInitializer(this, clientEnc));
+                break;
+            case ENCRYPTED:
+                logger.debug("Enabling encrypted CQL connections between client and server");
+                bootstrap.childHandler(new SecureInitializer(this, clientEnc));
+                break;
+            default:
+                throw new IllegalStateException("Unrecognized TLS encryption policy: " + this.tlsEncryptionPolicy);
         }
 
         // Bind and start to accept incoming connections.
-        logger.info("Using Netty Version: {}", Version.identify().entrySet());
-        logger.info("Starting listening for CQL clients on {} ({})...", socket, this.useSSL ? "encrypted" : "unencrypted");
+        logger.info("Starting listening for CQL clients on {} ({})...", socket, clientEnc.tlsEncryptionPolicy().description());
 
         ChannelFuture bindFuture = bootstrap.bind(socket);
         if (!bindFuture.awaitUninterruptibly().isSuccess())
@@ -217,14 +216,14 @@ public class Server implements CassandraDaemon.Server
     {
         private EventLoopGroup workerGroup;
         private EventExecutor eventExecutorGroup;
-        private boolean useSSL = false;
+        private EncryptionOptions.TlsEncryptionPolicy tlsEncryptionPolicy = EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED;
         private InetAddress hostAddr;
         private int port = -1;
         private InetSocketAddress socket;
 
-        public Builder withSSL(boolean useSSL)
+        public Builder withTlsEncryptionPolicy(EncryptionOptions.TlsEncryptionPolicy tlsEncryptionPolicy)
         {
-            this.useSSL = useSSL;
+            this.tlsEncryptionPolicy = tlsEncryptionPolicy;
             return this;
         }
 
@@ -366,6 +365,21 @@ public class Server implements CassandraDaemon.Server
             }
         }
 
+        public static long getCurrentGlobalUsage()
+        {
+            return globalRequestPayloadInFlight.using();
+        }
+
+        public static Snapshot getCurrentIpUsage()
+        {
+            DecayingEstimatedHistogramReservoir histogram = new DecayingEstimatedHistogramReservoir();
+            for (EndpointPayloadTracker tracker : requestPayloadInFlightPerEndpoint.values())
+            {
+                histogram.update(tracker.endpointAndGlobalPayloadsInFlight.endpoint().using());
+            }
+            return histogram.getSnapshot();
+        }
+
         public static long getGlobalLimit()
         {
             return DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytes();
@@ -403,6 +417,31 @@ public class Server implements CassandraDaemon.Server
         {
             if (-1 == refCount.updateAndGet(i -> i == 1 ? -1 : i - 1))
                 requestPayloadInFlightPerEndpoint.remove(endpoint, this);
+        }
+
+        /**
+         * This will recompute the ip usage histo on each query of the snapshot when requested instead of trying to keep
+         * a histogram up to date with each request
+         */
+        public static Reservoir ipUsageReservoir()
+        {
+            return new Reservoir()
+            {
+                public int size()
+                {
+                    return requestPayloadInFlightPerEndpoint.size();
+                }
+
+                public void update(long l)
+                {
+                    throw new IllegalStateException();
+                }
+
+                public Snapshot getSnapshot()
+                {
+                    return getCurrentIpUsage();
+                }
+            };
         }
     }
 

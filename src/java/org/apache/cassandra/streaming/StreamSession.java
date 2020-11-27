@@ -652,7 +652,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
             {
                 logger.error("[Stream #{}] Socket closed before session completion, peer {} is probably down.",
                              planId(),
-                             peer.address.getHostAddress(),
+                             peer.getHostAddressAndPort(),
                              e);
 
                 return closeSession(State.FAILED);
@@ -673,16 +673,16 @@ public class StreamSession implements IEndpointStateChangeSubscriber
         {
             logger.error("[Stream #{}] Did not receive response from peer {}{} for {} secs. Is peer down? " +
                          "If not, maybe try increasing streaming_keep_alive_period_in_secs.", planId(),
-                         peer.getHostAddress(true),
-                         template.connectTo == null ? "" : " through " + template.connectTo.getHostAddress(true),
+                         peer.getHostAddressAndPort(),
+                         template.connectTo == null ? "" : " through " + template.connectTo.getHostAddressAndPort(),
                          2 * DatabaseDescriptor.getStreamingKeepAlivePeriod(),
                          e);
         }
         else
         {
             logger.error("[Stream #{}] Streaming error occurred on session with peer {}{}", planId(),
-                         peer.getHostAddress(true),
-                         template.connectTo == null ? "" : " through " + template.connectTo.getHostAddress(true),
+                         peer.getHostAddressAndPort(),
+                         template.connectTo == null ? "" : " through " + template.connectTo.getHostAddressAndPort(),
                          e);
         }
     }
@@ -763,7 +763,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
      */
     public void streamSent(OutgoingStreamMessage message)
     {
-        long headerSize = message.stream.getSize();
+        long headerSize = message.stream.getEstimatedSize();
         StreamingMetrics.totalOutgoingBytes.inc(headerSize);
         metrics.outgoingBytes.inc(headerSize);
         // schedule timeout for receiving ACK

@@ -83,7 +83,7 @@ public class Config
 
     /* initial token in the ring */
     public String initial_token;
-    public int num_tokens = 1;
+    public Integer num_tokens;
     /** Triggers automatic allocation of tokens if set, using the replication strategy of the referenced keyspace */
     public String allocate_tokens_for_keyspace = null;
     /** Triggers automatic allocation of tokens if set, based on the provided replica count for a datacenter */
@@ -204,6 +204,7 @@ public class Config
 
     public boolean snapshot_before_compaction = false;
     public boolean auto_snapshot = true;
+    public volatile long snapshot_links_per_second = 0;
 
     /* if the size of columns or super-columns are more than this, indexing will kick in */
     public int column_index_size_in_kb = 64;
@@ -265,7 +266,7 @@ public class Config
     public boolean dynamic_snitch = true;
     public int dynamic_snitch_update_interval_in_ms = 100;
     public int dynamic_snitch_reset_interval_in_ms = 600000;
-    public double dynamic_snitch_badness_threshold = 0.1;
+    public double dynamic_snitch_badness_threshold = 1.0;
 
     public EncryptionOptions.ServerEncryptionOptions server_encryption_options = new EncryptionOptions.ServerEncryptionOptions();
     public EncryptionOptions client_encryption_options = new EncryptionOptions();
@@ -302,7 +303,11 @@ public class Config
     private static boolean isClientMode = false;
     private static Supplier<Config> overrideLoadConfig = null;
 
+    public Integer networking_cache_size_in_mb;
+
     public Integer file_cache_size_in_mb;
+
+    public boolean file_cache_enabled = Boolean.getBoolean("cassandra.file_cache_enabled");
 
     /**
      * Because of the current {@link org.apache.cassandra.utils.memory.BufferPool} slab sizes of 64 kb, we

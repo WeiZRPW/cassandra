@@ -37,7 +37,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.github.jamm.Unmetered;
 
 @Unmetered
-public final class ColumnMetadata extends ColumnSpecification implements Selectable, Comparable<ColumnMetadata>
+public class ColumnMetadata extends ColumnSpecification implements Selectable, Comparable<ColumnMetadata>
 {
     public static final Comparator<Object> asymmetricColumnDataComparator =
         (a, b) -> ((ColumnData) a).column().compareTo((ColumnMetadata) b);
@@ -86,7 +86,7 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
 
     private final Comparator<CellPath> cellPathComparator;
     private final Comparator<Object> asymmetricCellPathComparator;
-    private final Comparator<? super Cell> cellComparator;
+    private final Comparator<? super Cell<?>> cellComparator;
 
     private int hash;
 
@@ -171,7 +171,7 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
         this.position = position;
         this.cellPathComparator = makeCellPathComparator(kind, type);
         this.cellComparator = cellPathComparator == null ? ColumnData.comparator : (a, b) -> cellPathComparator.compare(a.path(), b.path());
-        this.asymmetricCellPathComparator = cellPathComparator == null ? null : (a, b) -> cellPathComparator.compare(((Cell)a).path(), (CellPath) b);
+        this.asymmetricCellPathComparator = cellPathComparator == null ? null : (a, b) -> cellPathComparator.compare(((Cell<?>)a).path(), (CellPath) b);
         this.comparisonOrder = comparisonOrder(kind, isComplex(), Math.max(0, position), name);
     }
 
@@ -200,6 +200,29 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
             assert path1.size() == 1 && path2.size() == 1;
             return nameComparator.compare(path1.get(0), path2.get(0));
         };
+    }
+
+    private static class Placeholder extends ColumnMetadata
+    {
+        Placeholder(TableMetadata table, ByteBuffer name, AbstractType<?> type, int position, Kind kind)
+        {
+            super(table, name, type, position, kind);
+        }
+
+        public boolean isPlaceholder()
+        {
+            return true;
+        }
+    }
+
+    public static ColumnMetadata placeholder(TableMetadata table, ByteBuffer name, boolean isStatic)
+    {
+        return new Placeholder(table, name, EmptyType.instance, NO_POSITION, isStatic ? Kind.STATIC : Kind.REGULAR);
+    }
+
+    public boolean isPlaceholder()
+    {
+        return false;
     }
 
     public ColumnMetadata copy()
@@ -370,7 +393,7 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
         return asymmetricCellPathComparator;
     }
 
-    public Comparator<? super Cell> cellComparator()
+    public Comparator<? super Cell<?>> cellComparator()
     {
         return cellComparator;
     }
@@ -391,11 +414,11 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
         return CollectionType.cellPathSerializer;
     }
 
-    public void validateCell(Cell cell)
+    public <V> void validateCell(Cell<V> cell)
     {
         if (cell.isTombstone())
         {
-            if (cell.value().hasRemaining())
+            if (cell.valueSize() > 0)
                 throw new MarshalException("A tombstone should not have a value");
             if (cell.path() != null)
                 validateCellPath(cell.path());
@@ -408,7 +431,7 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
         }
         else
         {
-            type.validateCellValue(cell.value());
+            type.validateCellValue(cell.value(), cell.accessor());
             if (cell.path() != null)
                 validateCellPath(cell.path());
         }

@@ -30,7 +30,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
-import java.util.stream.Stream;
 
 import javax.annotation.Nullable;
 
@@ -110,7 +109,8 @@ public class OutboundConnection
 
     private final OutboundMessageCallbacks callbacks;
     private final OutboundDebugCallbacks debug;
-    private final OutboundMessageQueue queue;
+    @VisibleForTesting
+    final OutboundMessageQueue queue;
     /** the number of bytes we permit to queue to the network without acquiring any shared resource permits */
     private final long pendingCapacityInBytes;
     /** the number of messages and bytes queued for flush to the network,
@@ -485,7 +485,7 @@ public class OutboundConnection
      */
     private void onFailedSerialize(Message<?> message, int messagingVersion, int bytesWrittenToNetwork, Throwable t)
     {
-        JVMStabilityInspector.inspectThrowable(t, false);
+        JVMStabilityInspector.inspectThrowable(t);
         releaseCapacity(1, canonicalSize(message));
         errorCount += 1;
         errorBytes += message.serializedSize(messagingVersion);
@@ -1047,7 +1047,7 @@ public class OutboundConnection
 
     private void invalidateChannel(Established established, Throwable cause)
     {
-        JVMStabilityInspector.inspectThrowable(cause, false);
+        JVMStabilityInspector.inspectThrowable(cause);
 
         if (state != established)
             return; // do nothing; channel already invalidated
@@ -1093,7 +1093,7 @@ public class OutboundConnection
                 else
                     noSpamLogger.error("{} failed to connect", id(), cause);
 
-                JVMStabilityInspector.inspectThrowable(cause, false);
+                JVMStabilityInspector.inspectThrowable(cause);
 
                 if (hasPending())
                 {
@@ -1151,7 +1151,7 @@ public class OutboundConnection
                                     id(true),
                                     success.messagingVersion,
                                     settings.framing,
-                                    encryptionLogStatement(channel, settings.encryption));
+                                    encryptionConnectionSummary(channel));
                         break;
 
                     case RETRY:

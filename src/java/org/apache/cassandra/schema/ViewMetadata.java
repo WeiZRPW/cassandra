@@ -194,7 +194,9 @@ public final class ViewMetadata implements SchemaElement
 
         metadata.appendPrimaryKey(builder);
 
-        builder.decreaseIndent();
+        builder.decreaseIndent()
+               .append(" WITH ")
+               .increaseIndent();
 
         metadata.appendTableOptions(builder, internals);
     }
@@ -218,18 +220,10 @@ public final class ViewMetadata implements SchemaElement
     }
 
     @Override
-    public String toCqlString(boolean withInternals)
+    public String toCqlString(boolean withInternals, boolean ifNotExists)
     {
         CqlBuilder builder = new CqlBuilder(2048);
-        appendCqlTo(builder, withInternals, false);
-        return builder.toString();
-    }
-
-    public String toCqlString(boolean internals,
-                              boolean ifNotExists)
-    {
-        CqlBuilder builder = new CqlBuilder(2048);
-        appendCqlTo(builder, internals, ifNotExists);
+        appendCqlTo(builder, withInternals, ifNotExists);
         return builder.toString();
     }
 }

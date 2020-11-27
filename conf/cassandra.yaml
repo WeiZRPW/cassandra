@@ -469,9 +469,22 @@ concurrent_counter_writes: 32
 # be limited by the less of concurrent reads or concurrent writes.
 concurrent_materialized_view_writes: 32
 
+# Maximum memory to use for inter-node and client-server networking buffers.
+#
+# Defaults to the smaller of 1/16 of heap or 128MB. This pool is allocated off-heap,
+# so is in addition to the memory allocated for heap. The cache also has on-heap
+# overhead which is roughly 128 bytes per chunk (i.e. 0.2% of the reserved size
+# if the default 64k chunk size is used).
+# Memory is only allocated when needed.
+# networking_cache_size_in_mb: 128
+
+# Enable the sstable chunk cache.  The chunk cache will store recently accessed
+# sections of the sstable in-memory as uncompressed buffers.
+# file_cache_enabled: false
+
 # Maximum memory to use for sstable chunk cache and buffer pooling.
-# 32MB of this are reserved for pooling buffers, the rest is used as an
-# cache that holds uncompressed sstable chunks.
+# 32MB of this are reserved for pooling buffers, the rest is used for chunk cache
+# that holds uncompressed sstable chunks.
 # Defaults to the smaller of 1/4 of heap or 512MB. This pool is allocated off-heap,
 # so is in addition to the memory allocated for heap. The cache also has on-heap
 # overhead which is roughly 128 bytes per chunk (i.e. 0.2% of the reserved size
@@ -778,6 +791,13 @@ snapshot_before_compaction: false
 # lose data on truncation or drop.
 auto_snapshot: true
 
+# The act of creating or clearing a snapshot involves creating or removing
+# potentially tens of thousands of links, which can cause significant performance
+# impact, especially on consumer grade SSDs. A non-zero value here can
+# be used to throttle these links to avoid negative performance impact of
+# taking and clearing snapshots
+snapshot_links_per_second: 0
+
 # Granularity of the collation index of rows within a partition.
 # Increase if your rows are large, or if you have a very large
 # number of rows per partition.  The competing goals are these:
@@ -1042,7 +1062,7 @@ dynamic_snitch_reset_interval_in_ms: 600000
 # expressed as a double which represents a percentage.  Thus, a value of
 # 0.2 means Cassandra would continue to prefer the static snitch values
 # until the pinned host was 20% worse than the fastest.
-dynamic_snitch_badness_threshold: 0.1
+dynamic_snitch_badness_threshold: 1.0
 
 # Configure server-to-server internode encryption
 #

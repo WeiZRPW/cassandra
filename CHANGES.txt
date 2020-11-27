@@ -1,4 +1,74 @@
+4.0-beta4
+ * Update jctools dependency to 3.1.0 (CASSANDRA-16255)
+ * 'SSLEngine closed already' exception on failed outbound connection (CASSANDRA-16277)
+ * Drain and/or shutdown might throw because of slow messaging service shutdown (CASSANDRA-16276)
+ * Upgrade JNA to 5.6.0, dropping support for <=glibc-2.6 systems (CASSANDRA-16212)
+ * Add saved Host IDs to TokenMetadata at startup (CASSANDRA-16246)
+ * Ensure that CacheMetrics.requests is picked up by the metric reporter (CASSANDRA-16228)
+ * Add a ratelimiter to snapshot creation and deletion (CASSANDRA-13019)
+ * Produce consistent tombstone for reads to avoid digest mistmatch (CASSANDRA-15369)
+ * Fix SSTableloader issue when restoring a table named backups (CASSANDRA-16235)
+ * Invalid serialized size for responses caused by increasing message time by 1ms which caused extra bytes in size calculation (CASSANDRA-16103)
+ * Throw BufferOverflowException from DataOutputBuffer for better visibility (CASSANDRA-16214)
+ * TLS connections to the storage port on a node without server encryption configured causes java.io.IOException accessing missing keystore (CASSANDRA-16144)
+ * Internode messaging catches OOMs and does not rethrow (CASSANDRA-15214)
+Merged from 3.11:
+ * SASI's `max_compaction_flush_memory_in_mb` settings over 100GB revert to default of 1GB (CASSANDRA-16071)
+Merged from 3.0:
+ * Avoid potential NPE in JVMStabilityInspector (CASSANDRA-16294)
+ * Improved check of num_tokens against the length of initial_token (CASSANDRA-14477)
+ * Fix a race condition on ColumnFamilyStore and TableMetrics (CASSANDRA-16228)
+ * Remove the SEPExecutor blocking behavior (CASSANDRA-16186)
+ * Wait for schema agreement when bootstrapping (CASSANDRA-15158)
+ * Prevent invoking enable/disable gossip when not in NORMAL (CASSANDRA-16146)
+ * Raise Dynamic Snitch Default Badness Threshold to 1.0 (CASSANDRA-16285)
+
+4.0-beta3
+ * Segregate Network and Chunk Cache BufferPools and Recirculate Partially Freed Chunks (CASSANDRA-15229)
+ * Fail truncation requests when they fail on a replica (CASSANDRA-16208)
+ * Move compact storage validation earlier in startup process (CASSANDRA-16063)
+ * Fix ByteBufferAccessor cast exceptions are thrown when trying to query a virtual table (CASSANDRA-16155)
+ * Consolidate node liveness check for forced repair (CASSANDRA-16113)
+ * Use unsigned short in ValueAccessor.sliceWithShortLength (CASSANDRA-16147)
+ * Abort repairs when getting a truncation request (CASSANDRA-15854)
+ * Remove bad assert when getting active compactions for an sstable (CASSANDRA-15457)
+ * Avoid failing compactions with very large partitions (CASSANDRA-15164)
+ * Prevent NPE in StreamMessage in type lookup (CASSANDRA-16131)
+ * Avoid invalid state transition exception during incremental repair (CASSANDRA-16067)
+ * Allow zero padding in timestamp serialization (CASSANDRA-16105)
+ * Add byte array backed cells (CASSANDRA-15393)
+ * Correctly handle pending ranges with adjacent range movements (CASSANDRA-14801)
+ * Avoid adding locahost when streaming trivial ranges (CASSANDRA-16099)
+ * Add nodetool getfullquerylog (CASSANDRA-15988)
+ * Fix yaml format and alignment in tpstats (CASSANDRA-11402)
+ * Avoid trying to keep track of RTs for endpoints we won't write to during read repair (CASSANDRA-16084)
+ * When compaction gets interrupted, the exception should include the compactionId (CASSANDRA-15954)
+ * Make Table/Keyspace Metric Names Consistent With Each Other (CASSANDRA-15909)
+ * Mutating sstable component may race with entire-sstable-streaming(ZCS) causing checksum validation failure (CASSANDRA-15861)
+ * NPE thrown while updating speculative execution time if keyspace is removed during task execution (CASSANDRA-15949)
+ * Show the progress of data streaming and index build (CASSANDRA-15406)
+ * Add flag to disable chunk cache and disable by default (CASSANDRA-16036)
+ * Upgrade to snakeyaml >= 1.26 version for CVE-2017-18640 fix (CASSANDRA-16150)
+Merged from 3.11:
+ * Fix ColumnFilter to avoid querying cells of unselected complex columns (CASSANDRA-15977)
+ * Fix memory leak in CompressedChunkReader (CASSANDRA-15880)
+ * Don't attempt value skipping with mixed version cluster (CASSANDRA-15833)
+ * Use IF NOT EXISTS for index and UDT create statements in snapshot schema files (CASSANDRA-13935)
+ * Make sure LCS handles duplicate sstable added/removed notifications correctly (CASSANDRA-14103)
+Merged from 3.0:
+ * Avoid marking shutting down nodes as up after receiving gossip shutdown message (CASSANDRA-16094)
+ * Handle unexpected columns due to schema races (CASSANDRA-15899)
+ * Add flag to ignore unreplicated keyspaces during repair (CASSANDRA-15160)
+Merged from 2.2:
+ * Package tools/bin scripts as executable (CASSANDRA-16151)
+ * Fixed a NullPointerException when calling nodetool enablethrift (CASSANDRA-16127)
+ * Automatically drop compact storage on tables for which it is safe (CASSANDRA-16048)
+ * Fixed NullPointerException for COMPACT STORAGE tables with null clustering (CASSANDRA-16241)
+
 4.0-beta2
+ * Add addition incremental repair visibility to nodetool repair_admin (CASSANDRA-14939)
+ * Always access system properties and environment variables via the new CassandraRelevantProperties and CassandraRelevantEnv classes (CASSANDRA-15876)
+ * Remove deprecated HintedHandOffManager (CASSANDRA-15939)
  * Prevent repair from overrunning compaction (CASSANDRA-15817)
  * fix cqlsh COPY functions in Python 3.8 on Mac (CASSANDRA-16053)
  * Strip comment blocks from cqlsh input before processing statements (CASSANDRA-15802)
@@ -15,7 +85,9 @@
  * Fix version parsing logic when upgrading from 3.0 (CASSANDRA-15973)
  * Optimize NoSpamLogger use in hot paths (CASSANDRA-15766)
  * Verify sstable components on startup (CASSANDRA-15945)
+ * Resolve JMX output inconsistencies from CASSANDRA-7544 storage-port-configurable-per-node (CASSANDRA-15937)
 Merged from 3.11:
+ * Correctly interpret SASI's `max_compaction_flush_memory_in_mb` setting in megabytes not bytes (CASSANDRA-16071)
  * Fix short read protection for GROUP BY queries (CASSANDRA-15459)
  * stop_paranoid disk failure policy is ignored on CorruptSSTableException after node is up (CASSANDRA-15191)
  * Frozen RawTuple is not annotated with frozen in the toString method (CASSANDRA-15857)
@@ -28,6 +100,8 @@ Merged from 3.0:
  * Handle difference in timestamp precision between java8 and java11 in LogFIle.java (CASSANDRA-16050)
 Merged from 2.2:
  * Fix CQL parsing of collections when the column type is reversed (CASSANDRA-15814)
+Merged from 2.1:
+ * Only allow strings to be passed to JMX authentication (CASSANDRA-16077)
 
 4.0-beta1
  * Remove BackPressureStrategy (CASSANDRA-15375)

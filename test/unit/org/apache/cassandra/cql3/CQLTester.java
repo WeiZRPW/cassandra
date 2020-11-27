@@ -42,6 +42,7 @@ import javax.management.remote.JMXConnector;
 import javax.management.remote.JMXConnectorFactory;
 import javax.management.remote.JMXConnectorServer;
 import javax.management.remote.JMXServiceURL;
+import javax.management.remote.rmi.RMIConnectorServer;
 
 import com.google.common.base.Objects;
 import com.google.common.base.Strings;
@@ -192,8 +193,6 @@ public abstract class CQLTester
             throw new RuntimeException(e);
         }
     }
-
-    public static ResultMessage lastSchemaChangeResult;
 
     private List<String> keyspaces = new ArrayList<>();
     private List<String> tables = new ArrayList<>();
@@ -376,6 +375,18 @@ public abstract class CQLTester
 
         TokenMetadata metadata = StorageService.instance.getTokenMetadata();
         metadata.clearUnsafe();
+
+        if (jmxServer != null && jmxServer instanceof RMIConnectorServer)
+        {
+            try
+            {
+                ((RMIConnectorServer) jmxServer).stop();
+            }
+            catch (IOException e)
+            {
+                logger.warn("Error shutting down jmx", e);
+            }
+        }
     }
 
     @Before
@@ -451,7 +462,7 @@ public abstract class CQLTester
             }
         });
     }
-    
+
     public static List<String> buildNodetoolArgs(List<String> args)
     {
         List<String> allArgs = new ArrayList<>();
@@ -459,11 +470,35 @@ public abstract class CQLTester
         allArgs.add("-p");
         allArgs.add(Integer.toString(jmxPort));
         allArgs.add("-h");
-        allArgs.add(jmxHost);
+        allArgs.add(jmxHost == null ? "127.0.0.1" : jmxHost);
         allArgs.addAll(args);
         return allArgs;
     }
-    
+
+    public static List<String> buildCqlshArgs(List<String> args)
+    {
+        List<String> allArgs = new ArrayList<>();
+        allArgs.add("bin/cqlsh");
+        allArgs.add(nativeAddr.getHostAddress());
+        allArgs.add(Integer.toString(nativePort));
+        allArgs.add("-e");
+        allArgs.addAll(args);
+        return allArgs;
+    }
+
+    public static List<String> buildCassandraStressArgs(List<String> args)
+    {
+        List<String> allArgs = new ArrayList<>();
+        allArgs.add("tools/bin/cassandra-stress");
+        allArgs.addAll(args);
+        if (args.indexOf("-port") == -1)
+        {
+            allArgs.add("-port");
+            allArgs.add("native=" + Integer.toString(nativePort));
+        }
+        return allArgs;
+    }
+
     // lazy initialization for all tests that require Java Driver
     protected static void requireNetwork() throws ConfigurationException
     {
@@ -676,24 +711,44 @@ public abstract class CQLTester
         return typeName;
     }
 
+    protected String createFunctionName(String keyspace)
+    {
+        return String.format("%s.function_%02d", keyspace, seqNumber.getAndIncrement());
+    }
+
+    protected void registerFunction(String functionName, String argTypes)
+    {
+        functions.add(functionName + '(' + argTypes + ')');
+    }
+
     protected String createFunction(String keyspace, String argTypes, String query) throws Throwable
     {
-        String functionName = String.format("%s.function_%02d", keyspace, seqNumber.getAndIncrement());
+        String functionName = createFunctionName(keyspace);
         createFunctionOverload(functionName, argTypes, query);
         return functionName;
     }
 
     protected void createFunctionOverload(String functionName, String argTypes, String query) throws Throwable
     {
+        registerFunction(functionName, argTypes);
         String fullQuery = String.format(query, functionName);
-        functions.add(functionName + '(' + argTypes + ')');
         logger.info(fullQuery);
         schemaChange(fullQuery);
     }
 
+    protected String createAggregateName(String keyspace)
+    {
+        return String.format("%s.aggregate_%02d", keyspace, seqNumber.getAndIncrement());
+    }
+
+    protected void registerAggregate(String aggregateName, String argTypes)
+    {
+        aggregates.add(aggregateName + '(' + argTypes + ')');
+    }
+
     protected String createAggregate(String keyspace, String argTypes, String query) throws Throwable
     {
-        String aggregateName = String.format("%s.aggregate_%02d", keyspace, seqNumber.getAndIncrement());
+        String aggregateName = createAggregateName(keyspace);
         createAggregateOverload(aggregateName, argTypes, query);
         return aggregateName;
     }
@@ -701,7 +756,7 @@ public abstract class CQLTester
     protected void createAggregateOverload(String aggregateName, String argTypes, String query) throws Throwable
     {
         String fullQuery = String.format(query, aggregateName);
-        aggregates.add(aggregateName + '(' + argTypes + ')');
+        registerAggregate(aggregateName, argTypes);
         logger.info(fullQuery);
         schemaChange(fullQuery);
     }
@@ -908,20 +963,24 @@ public abstract class CQLTester
         schemaChange(fullQuery);
     }
 
-    protected void assertLastSchemaChange(Event.SchemaChange.Change change, Event.SchemaChange.Target target,
-                                          String keyspace, String name,
-                                          String... argTypes)
+    protected static void assertSchemaChange(String query,
+                                             Event.SchemaChange.Change expectedChange,
+                                             Event.SchemaChange.Target expectedTarget,
+                                             String expectedKeyspace,
+                                             String expectedName,
+                                             String... expectedArgTypes)
     {
-        Assert.assertTrue(lastSchemaChangeResult instanceof ResultMessage.SchemaChange);
-        ResultMessage.SchemaChange schemaChange = (ResultMessage.SchemaChange) lastSchemaChangeResult;
-        Assert.assertSame(change, schemaChange.change.change);
-        Assert.assertSame(target, schemaChange.change.target);
-        Assert.assertEquals(keyspace, schemaChange.change.keyspace);
-        Assert.assertEquals(name, schemaChange.change.name);
-        Assert.assertEquals(argTypes != null ? Arrays.asList(argTypes) : null, schemaChange.change.argTypes);
+        ResultMessage actual = schemaChange(query);
+        Assert.assertTrue(actual instanceof ResultMessage.SchemaChange);
+        Event.SchemaChange schemaChange = ((ResultMessage.SchemaChange) actual).change;
+        Assert.assertSame(expectedChange, schemaChange.change);
+        Assert.assertSame(expectedTarget, schemaChange.target);
+        Assert.assertEquals(expectedKeyspace, schemaChange.keyspace);
+        Assert.assertEquals(expectedName, schemaChange.name);
+        Assert.assertEquals(expectedArgTypes != null ? Arrays.asList(expectedArgTypes) : null, schemaChange.argTypes);
     }
 
-    protected static void schemaChange(String query)
+    protected static ResultMessage schemaChange(String query)
     {
         try
         {
@@ -933,7 +992,7 @@ public abstract class CQLTester
 
             QueryOptions options = QueryOptions.forInternalCalls(Collections.<ByteBuffer>emptyList());
 
-            lastSchemaChangeResult = statement.executeLocally(queryState, options);
+            return statement.executeLocally(queryState, options);
         }
         catch (Exception e)
         {
@@ -986,7 +1045,7 @@ public abstract class CQLTester
 
     protected SimpleClient newSimpleClient(ProtocolVersion version, boolean compression, boolean checksums, boolean isOverloadedException) throws IOException
     {
-        return new SimpleClient(nativeAddr.getHostAddress(), nativePort, version, version.isBeta(), new EncryptionOptions()).connect(compression, checksums, isOverloadedException);
+        return new SimpleClient(nativeAddr.getHostAddress(), nativePort, version, version.isBeta(), new EncryptionOptions().applyConfig()).connect(compression, checksums, isOverloadedException);
     }
 
     protected SimpleClient newSimpleClient(ProtocolVersion version, boolean compression, boolean checksums) throws IOException
@@ -1778,7 +1837,7 @@ public abstract class CQLTester
             throw new IllegalArgumentException("Invalid number of arguments, got " + values.length);
 
         int size = values.length / 2;
-        Map m = new LinkedHashMap(size);
+        Map<Object, Object> m = new LinkedHashMap<>(size);
         for (int i = 0; i < size; i++)
             m.put(values[2 * i], values[(2 * i) + 1]);
         return m;
