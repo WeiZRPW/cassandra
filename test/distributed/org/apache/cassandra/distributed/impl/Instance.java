@@ -64,6 +64,8 @@ import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.SystemKeyspaceMigrator40;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.Constants;
 import org.apache.cassandra.distributed.action.GossipHelper;
@@ -79,7 +81,10 @@ import org.apache.cassandra.distributed.api.NodeToolResult;
 import org.apache.cassandra.distributed.api.SimpleQueryResult;
 import org.apache.cassandra.distributed.mock.nodetool.InternalNodeProbe;
 import org.apache.cassandra.distributed.mock.nodetool.InternalNodeProbeFactory;
+import org.apache.cassandra.distributed.shared.Metrics;
+import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.hints.HintsService;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.io.IVersionedAsymmetricSerializer;
@@ -89,6 +94,7 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.NoPayload;
@@ -251,7 +257,9 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
     {
         MessagingService.instance().outboundSink.add((message, to) -> {
             InetSocketAddress toAddr = fromCassandraInetAddressAndPort(to);
-            cluster.get(toAddr).receiveMessage(serializeMessage(message.from(), to, message));
+            IInstance toInstance = cluster.get(toAddr);
+            if (toInstance != null)
+                toInstance.receiveMessage(serializeMessage(message.from(), to, message));
             return false;
         });
     }
@@ -262,7 +270,10 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
             if (isShutdown())
                 return false;
             IMessage serialized = serializeMessage(message.from(), toCassandraInetAddressAndPort(broadcastAddress()), message);
-            int fromNum = cluster.get(serialized.from()).config().num();
+            IInstance from = cluster.get(serialized.from());
+            if (from == null)
+                return false;
+            int fromNum = from.config().num();
             int toNum = config.num(); // since this instance is reciving the message, to will always be this instance
             return cluster.filters().permitInbound(fromNum, toNum, serialized);
         });
@@ -275,7 +286,10 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                 return false;
             IMessage serialzied = serializeMessage(message.from(), to, message);
             int fromNum = config.num(); // since this instance is sending the message, from will always be this instance
-            int toNum = cluster.get(fromCassandraInetAddressAndPort(to)).config().num();
+            IInstance toInstance = cluster.get(fromCassandraInetAddressAndPort(to));
+            if (toInstance == null)
+                return false;
+            int toNum = toInstance.config().num();
             return cluster.filters().permitOutbound(fromNum, toNum, serialzied);
         });
     }
@@ -449,6 +463,9 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                     throw new RuntimeException(e);
                 }
 
+                // Re-populate token metadata after commit log recover (new peers might be loaded onto system keyspace #10293)
+                StorageService.instance.populateTokenMetadata();
+
                 Verb.REQUEST_RSP.unsafeSetSerializer(() -> ReadResponse.serializer);
 
                 if (config.has(NETWORK))
@@ -485,10 +502,9 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                             GossipHelper.unsafeStatusToNormal(this, (IInstance) peer);
                     });
 
+                    StorageService.instance.setUpDistributedSystemKeyspaces();
                     StorageService.instance.setNormalModeUnsafe();
                 }
-
-                StorageService.instance.ensureTraceKeyspace();
 
                 // Populate tokenMetadata for the second time,
                 // see org.apache.cassandra.service.CassandraDaemon.setup
@@ -536,6 +552,85 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
         if (overrides.get(Constants.KEY_DTEST_API_CONFIG_CHECK) != null)
             check = (boolean) overrides.get(Constants.KEY_DTEST_API_CONFIG_CHECK);
         return YamlConfigurationLoader.fromMap(params, check, Config.class);
+    }
+
+    public static void addToRing(boolean bootstrapping, IInstance peer)
+    {
+        try
+        {
+            IInstanceConfig config = peer.config();
+            IPartitioner partitioner = FBUtilities.newPartitioner(config.getString("partitioner"));
+            Token token = partitioner.getTokenFactory().fromString(config.getString("initial_token"));
+            InetAddressAndPort addressAndPort = toCassandraInetAddressAndPort(peer.broadcastAddress());
+
+            UUID hostId = config.hostId();
+            Gossiper.runInGossipStageBlocking(() -> {
+                Gossiper.instance.initializeNodeUnsafe(addressAndPort, hostId, 1);
+                Gossiper.instance.injectApplicationState(addressAndPort,
+                                                         ApplicationState.TOKENS,
+                                                         new VersionedValue.VersionedValueFactory(partitioner).tokens(Collections.singleton(token)));
+                StorageService.instance.onChange(addressAndPort,
+                                                 ApplicationState.STATUS,
+                                                 bootstrapping
+                                                 ? new VersionedValue.VersionedValueFactory(partitioner).bootstrapping(Collections.singleton(token))
+                                                 : new VersionedValue.VersionedValueFactory(partitioner).normal(Collections.singleton(token)));
+                Gossiper.instance.realMarkAlive(addressAndPort, Gossiper.instance.getEndpointStateForEndpoint(addressAndPort));
+            });
+            int messagingVersion = peer.isShutdown()
+                    ? MessagingService.current_version
+                    : Math.min(MessagingService.current_version, peer.getMessagingVersion());
+            MessagingService.instance().versions.set(addressAndPort, messagingVersion);
+
+            assert bootstrapping || StorageService.instance.getTokenMetadata().isMember(addressAndPort);
+            PendingRangeCalculatorService.instance.blockUntilFinished();
+        }
+        catch (Throwable e) // UnknownHostException
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static void removeFromRing(IInstance peer)
+    {
+        try
+        {
+            IInstanceConfig config = peer.config();
+            IPartitioner partitioner = FBUtilities.newPartitioner(config.getString("partitioner"));
+            Token token = partitioner.getTokenFactory().fromString(config.getString("initial_token"));
+            InetAddressAndPort addressAndPort = toCassandraInetAddressAndPort(peer.broadcastAddress());
+
+            Gossiper.runInGossipStageBlocking(() -> {
+                StorageService.instance.onChange(addressAndPort,
+                        ApplicationState.STATUS,
+                        new VersionedValue.VersionedValueFactory(partitioner).left(Collections.singleton(token), 0L));
+                Gossiper.instance.removeEndpoint(addressAndPort);
+            });
+            PendingRangeCalculatorService.instance.blockUntilFinished();
+        }
+        catch (Throwable e) // UnknownHostException
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static void addToRingNormal(IInstance peer)
+    {
+        addToRing(false, peer);
+        assert StorageService.instance.getTokenMetadata().isMember(toCassandraInetAddressAndPort(peer.broadcastAddress()));
+    }
+
+    public static void addToRingBootstrapping(IInstance peer)
+    {
+        addToRing(true, peer);
+    }
+
+    private static void initializeRing(ICluster cluster)
+    {
+        for (int i = 1 ; i <= cluster.size() ; ++i)
+            addToRing(false, cluster.get(i));
+
+        for (int i = 1; i <= cluster.size(); ++i)
+            assert StorageService.instance.getTokenMetadata().isMember(toCassandraInetAddressAndPort(cluster.get(i).broadcastAddress()));
     }
 
     public Future<Void> shutdown()
@@ -601,6 +696,7 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                                 .thenRun(super::shutdown);
     }
 
+    @Override
     public int liveMemberCount()
     {
         return sync(() -> {
@@ -610,6 +706,13 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
         }).call();
     }
 
+    @Override
+    public Metrics metrics()
+    {
+        return callOnInstance(() -> new InstanceMetrics(CassandraMetricsRegistry.Metrics));
+    }
+
+    @Override
     public NodeToolResult nodetoolResult(boolean withNotifications, String... commandAndArgs)
     {
         return sync(() -> {
@@ -652,6 +755,12 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                                           output.getErrString());
             }
         }).call();
+    }
+
+    @Override
+    public String toString()
+    {
+        return "node" + config.num();
     }
 
     private static class CapturingOutput implements Closeable
